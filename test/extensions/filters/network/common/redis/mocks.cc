@@ -9,6 +9,7 @@
 
 using testing::_;
 using testing::Invoke;
+using testing::Return;
 
 namespace Envoy {
 namespace Extensions {
@@ -36,9 +37,14 @@ MockDecoder::~MockDecoder() = default;
 namespace Client {
 
 MockClient::MockClient() {
+  ON_CALL(*this, isOpen()).WillByDefault(Return(true));
   ON_CALL(*this, addConnectionCallbacks(_))
       .WillByDefault(Invoke([this](Network::ConnectionCallbacks& callbacks) -> void {
         callbacks_.push_back(&callbacks);
+      }));
+  ON_CALL(*this, removeConnectionCallbacks(_))
+      .WillByDefault(Invoke([this](Network::ConnectionCallbacks& callbacks) -> void {
+        callbacks_.remove(&callbacks);
       }));
   ON_CALL(*this, close()).WillByDefault(Invoke([this]() -> void {
     raiseEvent(Network::ConnectionEvent::LocalClose);

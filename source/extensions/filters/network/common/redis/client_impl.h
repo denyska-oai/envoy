@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 #include "envoy/stats/timespan.h"
@@ -99,9 +100,17 @@ public:
   void addConnectionCallbacks(Network::ConnectionCallbacks& callbacks) override {
     connection_->addConnectionCallbacks(callbacks);
   }
+  void removeConnectionCallbacks(Network::ConnectionCallbacks& callbacks) override {
+    connection_->removeConnectionCallbacks(callbacks);
+  }
   void close() override;
   PoolRequest* makeRequest(const RespValue& request, ClientCallbacks& callbacks) override;
+  PoolRequest* makeRequest(const RespValue& request, ClientCallbacks& callbacks,
+                           const RequestOptions& options) override;
   bool active() override { return !pending_requests_.empty(); }
+  bool isOpen() const override {
+    return connection_ != nullptr && connection_->state() == Network::Connection::State::Open;
+  }
   void flushBufferAndResetTimer();
   void initialize(const std::string& auth_username, const std::string& auth_password) override;
   void sendAwsIamAuth(
@@ -135,7 +144,8 @@ private:
   };
 
   struct PendingRequest : public PoolRequest {
-    PendingRequest(ClientImpl& parent, ClientCallbacks& callbacks, Stats::StatName stat_name);
+    PendingRequest(ClientImpl& parent, ClientCallbacks& callbacks, Stats::StatName stat_name,
+                   const RequestOptions& request_options);
     ~PendingRequest() override;
 
     // PoolRequest
@@ -144,12 +154,15 @@ private:
     ClientImpl& parent_;
     ClientCallbacks& callbacks_;
     Stats::StatName command_;
+    const RequestOptions request_options_;
     bool canceled_{};
     Stats::TimespanPtr aggregate_request_timer_;
     Stats::TimespanPtr command_request_timer_;
   };
 
   void onConnectOrOpTimeout();
+  std::optional<std::chrono::milliseconds> requestTimeout(const PendingRequest& request) const;
+  void resetTimerForRequest(const PendingRequest& request);
   void onData(Buffer::Instance& data);
   void putOutlierEvent(Upstream::Outlier::Result result);
 

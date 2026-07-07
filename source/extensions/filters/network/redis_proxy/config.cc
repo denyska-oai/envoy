@@ -44,6 +44,11 @@ Network::FilterFactoryCb RedisProxyFilterConfigFactory::createFilterFactoryFromP
   ASSERT(!proto_config.stat_prefix().empty());
   ASSERT(proto_config.has_settings());
 
+  if (proto_config.settings().has_static_shard_routing() &&
+      proto_config.settings().enable_redirection()) {
+    throw EnvoyException("static_shard_routing cannot be combined with enable_redirection");
+  }
+
   Extensions::Common::Redis::ClusterRefreshManagerSharedPtr refresh_manager =
       Extensions::Common::Redis::getClusterRefreshManager(
           server_context.singletonManager(), server_context.mainThreadDispatcher(),

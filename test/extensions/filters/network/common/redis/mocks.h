@@ -81,9 +81,17 @@ public:
     client_callbacks_.push_back(&callbacks);
     return makeRequest_(request, callbacks);
   }
+  PoolRequest* makeRequest(const Common::Redis::RespValue& request, ClientCallbacks& callbacks,
+                           const RequestOptions& options) override {
+    last_request_options_ = options;
+    client_callbacks_.push_back(&callbacks);
+    return makeRequest_(request, callbacks);
+  }
 
   MOCK_METHOD(void, addConnectionCallbacks, (Network::ConnectionCallbacks & callbacks));
+  MOCK_METHOD(void, removeConnectionCallbacks, (Network::ConnectionCallbacks & callbacks));
   MOCK_METHOD(bool, active, ());
+  MOCK_METHOD(bool, isOpen, (), (const));
   MOCK_METHOD(void, close, ());
   MOCK_METHOD(PoolRequest*, makeRequest_,
               (const Common::Redis::RespValue& request, ClientCallbacks& callbacks));
@@ -94,6 +102,7 @@ public:
 
   std::list<Network::ConnectionCallbacks*> callbacks_;
   std::list<ClientCallbacks*> client_callbacks_;
+  RequestOptions last_request_options_;
 };
 
 class MockClientCallbacks : public ClientCallbacks {

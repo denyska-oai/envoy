@@ -425,6 +425,89 @@ TEST_F(RedisProxyFilterTestWithTwoCallbacks, OutOfOrderResponseDownstreamDisconn
   filter_callbacks_.connection_.raiseEvent(Network::ConnectionEvent::RemoteClose);
 }
 
+TEST_F(RedisProxyFilterTest, DispatchBarrierQueuesLaterDownstreamRequest) {
+  InSequence s;
+
+  auto* blocking_handle = new CommandSplitter::MockSplitRequest();
+  blocking_handle->blocks_downstream_dispatch_ = true;
+  auto* later_handle = new CommandSplitter::MockSplitRequest();
+  CommandSplitter::SplitCallbacks* blocking_callbacks;
+
+  Common::Redis::RespValuePtr blocking_request(new Common::Redis::RespValue());
+  splitter_.requires_downstream_dispatch_barrier_ = true;
+  EXPECT_CALL(filter_callbacks_.connection_, readDisable(true));
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*blocking_request), _, _, _))
+      .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&blocking_callbacks)), Return(blocking_handle)));
+  decoder_callbacks_->onRespValue(std::move(blocking_request));
+  splitter_.requires_downstream_dispatch_barrier_ = false;
+
+  Common::Redis::RespValuePtr later_request(new Common::Redis::RespValue());
+  Common::Redis::RespValue* later_request_ptr = later_request.get();
+  decoder_callbacks_->onRespValue(std::move(later_request));
+
+  CommandSplitter::SplitCallbacks* later_callbacks;
+  EXPECT_CALL(*encoder_, encode(_, _));
+  EXPECT_CALL(filter_callbacks_.connection_, write(_, _));
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*later_request_ptr), _, _, _))
+      .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&later_callbacks)), Return(later_handle)));
+  EXPECT_CALL(filter_callbacks_.connection_, readDisable(false));
+
+  Common::Redis::RespValuePtr response(new Common::Redis::RespValue());
+  blocking_callbacks->onResponse(std::move(response));
+  EXPECT_NE(nullptr, later_callbacks);
+
+  EXPECT_CALL(*later_handle, cancel());
+  filter_callbacks_.connection_.raiseEvent(Network::ConnectionEvent::RemoteClose);
+}
+
+TEST_F(RedisProxyFilterTest, DispatchBarrierWaitsForEarlierDownstreamRequest) {
+  InSequence s;
+
+  auto* earlier_handle = new CommandSplitter::MockSplitRequest();
+  auto* blocking_handle = new CommandSplitter::MockSplitRequest();
+  blocking_handle->blocks_downstream_dispatch_ = true;
+  auto* later_handle = new CommandSplitter::MockSplitRequest();
+  CommandSplitter::SplitCallbacks* earlier_callbacks;
+  CommandSplitter::SplitCallbacks* blocking_callbacks;
+  CommandSplitter::SplitCallbacks* later_callbacks;
+
+  Common::Redis::RespValuePtr earlier_request(new Common::Redis::RespValue());
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*earlier_request), _, _, _))
+      .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&earlier_callbacks)), Return(earlier_handle)));
+  decoder_callbacks_->onRespValue(std::move(earlier_request));
+
+  Common::Redis::RespValuePtr blocking_request(new Common::Redis::RespValue());
+  Common::Redis::RespValue* blocking_request_ptr = blocking_request.get();
+  splitter_.requires_downstream_dispatch_barrier_ = true;
+  EXPECT_CALL(filter_callbacks_.connection_, readDisable(true));
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*blocking_request_ptr), _, _, _)).Times(0);
+  decoder_callbacks_->onRespValue(std::move(blocking_request));
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(&splitter_));
+  splitter_.requires_downstream_dispatch_barrier_ = false;
+
+  // A later command is also held while the blocking request waits behind the earlier request.
+  Common::Redis::RespValuePtr later_request(new Common::Redis::RespValue());
+  Common::Redis::RespValue* later_request_ptr = later_request.get();
+  decoder_callbacks_->onRespValue(std::move(later_request));
+
+  EXPECT_CALL(*encoder_, encode(_, _));
+  EXPECT_CALL(filter_callbacks_.connection_, write(_, _));
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*blocking_request_ptr), _, _, _))
+      .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&blocking_callbacks)), Return(blocking_handle)));
+  earlier_callbacks->onResponse(std::make_unique<Common::Redis::RespValue>());
+
+  EXPECT_CALL(*encoder_, encode(_, _));
+  EXPECT_CALL(filter_callbacks_.connection_, write(_, _));
+  EXPECT_CALL(splitter_, makeRequest_(Ref(*later_request_ptr), _, _, _))
+      .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&later_callbacks)), Return(later_handle)));
+  EXPECT_CALL(filter_callbacks_.connection_, readDisable(false));
+  blocking_callbacks->onResponse(std::make_unique<Common::Redis::RespValue>());
+  EXPECT_NE(nullptr, later_callbacks);
+
+  EXPECT_CALL(*later_handle, cancel());
+  filter_callbacks_.connection_.raiseEvent(Network::ConnectionEvent::RemoteClose);
+}
+
 TEST_F(RedisProxyFilterTest, DownstreamDisconnectWithActive) {
   InSequence s;
 

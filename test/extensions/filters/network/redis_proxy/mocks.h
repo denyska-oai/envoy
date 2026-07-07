@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <list>
 #include <string>
@@ -95,6 +96,12 @@ public:
   }
 
   Common::Redis::Client::PoolRequest*
+  makeBlockingRequest(const std::string& hash_key, RespVariant&& request, PoolCallbacks& callbacks,
+                      std::chrono::milliseconds blocking_timeout) override {
+    return makeBlockingRequest_(hash_key, request, callbacks, blocking_timeout);
+  }
+
+  Common::Redis::Client::PoolRequest*
   makeRequestToShard(uint16_t shard_index, RespVariant&& request, PoolCallbacks& callbacks,
                      Common::Redis::Client::Transaction&) override {
     return makeRequestToShard_(shard_index, request, callbacks);
@@ -103,6 +110,9 @@ public:
   MOCK_METHOD(uint16_t, shardSize_, ());
   MOCK_METHOD(Common::Redis::Client::PoolRequest*, makeRequest_,
               (const std::string& hash_key, RespVariant& request, PoolCallbacks& callbacks));
+  MOCK_METHOD(Common::Redis::Client::PoolRequest*, makeBlockingRequest_,
+              (const std::string& hash_key, RespVariant& request, PoolCallbacks& callbacks,
+               std::chrono::milliseconds blocking_timeout));
   MOCK_METHOD(Common::Redis::Client::PoolRequest*, makeRequestToShard_,
               (uint16_t shard_index, RespVariant& request, PoolCallbacks& callbacks));
   MOCK_METHOD(bool, onRedirection, ());
@@ -117,6 +127,9 @@ public:
   ~MockSplitRequest() override;
 
   MOCK_METHOD(void, cancel, ());
+  bool blocksDownstreamDispatch() const override { return blocks_downstream_dispatch_; }
+
+  bool blocks_downstream_dispatch_{false};
 };
 
 class MockSplitCallbacks : public SplitCallbacks {
@@ -142,6 +155,10 @@ public:
   MockInstance();
   ~MockInstance() override;
 
+  bool requiresDownstreamDispatchBarrier(const Common::Redis::RespValue&) const override {
+    return requires_downstream_dispatch_barrier_;
+  }
+
   SplitRequestPtr makeRequest(Common::Redis::RespValuePtr&& request, SplitCallbacks& callbacks,
                               Event::Dispatcher& dispatcher,
                               const StreamInfo::StreamInfo& stream_info) override {
@@ -150,6 +167,8 @@ public:
   MOCK_METHOD(SplitRequest*, makeRequest_,
               (const Common::Redis::RespValue& request, SplitCallbacks& callbacks,
                Event::Dispatcher& dispatcher, const StreamInfo::StreamInfo& stream_info));
+
+  bool requires_downstream_dispatch_barrier_{false};
 };
 
 } // namespace CommandSplitter

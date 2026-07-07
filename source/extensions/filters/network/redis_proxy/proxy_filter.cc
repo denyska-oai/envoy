@@ -110,15 +110,27 @@ void ProxyFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& ca
 void ProxyFilter::onRespValue(Common::Redis::RespValuePtr&& value) {
   pending_requests_.emplace_back(*this);
   PendingRequest& request = pending_requests_.back();
+  request.blocks_downstream_dispatch_ = splitter_.requiresDownstreamDispatchBarrier(*value);
+  const bool has_earlier_requests = pending_requests_.size() > 1;
+  if (request.blocks_downstream_dispatch_) {
+    // A blocking request uses a separate upstream connection. Hold it until earlier requests on
+    // this downstream connection complete, then hold later requests until it completes.
+    setDispatchBlocked(true);
+  }
 
   // If external authentication is enabled and an AUTH command is ongoing,
   // we keep the request in the queue and let it be processed when the
   // authentication response is received.
-  if (external_auth_call_status_ == ExternalAuthCallStatus::Pending) {
+  if (external_auth_call_status_ == ExternalAuthCallStatus::Pending || dispatch_barrier_active_ ||
+      (dispatch_blocked_ && !request.blocks_downstream_dispatch_) ||
+      (request.blocks_downstream_dispatch_ && has_earlier_requests)) {
     request.pending_request_value_ = std::move(value);
     return;
   }
 
+  if (request.blocks_downstream_dispatch_) {
+    dispatch_barrier_active_ = true;
+  }
   processRespValue(std::move(value), request);
 }
 
@@ -129,8 +141,65 @@ void ProxyFilter::processRespValue(Common::Redis::RespValuePtr&& value, PendingR
   if (split) {
     // The splitter can immediately respond and destroy the pending request. Only store the handle
     // if the request is still alive.
+    ASSERT(!split->blocksDownstreamDispatch() || request.blocks_downstream_dispatch_);
+    request.blocks_downstream_dispatch_ =
+        request.blocks_downstream_dispatch_ || split->blocksDownstreamDispatch();
+    if (request.blocks_downstream_dispatch_) {
+      setDispatchBlocked(true);
+      dispatch_barrier_active_ = true;
+    }
     request.request_handle_ = std::move(split);
   }
+}
+
+void ProxyFilter::resumePendingRequests() {
+  if (external_auth_call_status_ == ExternalAuthCallStatus::Pending || dispatch_barrier_active_) {
+    return;
+  }
+
+  while (true) {
+    auto pending = pending_requests_.end();
+    for (auto it = pending_requests_.begin(); it != pending_requests_.end(); ++it) {
+      if (it->pending_request_value_) {
+        pending = it;
+        break;
+      }
+    }
+    if (pending == pending_requests_.end()) {
+      setDispatchBlocked(false);
+      return;
+    }
+
+    if (pending->blocks_downstream_dispatch_) {
+      // A queued blocking request cannot use its separate upstream connection until every earlier
+      // downstream request has completed.
+      if (pending != pending_requests_.begin()) {
+        setDispatchBlocked(true);
+        return;
+      }
+      setDispatchBlocked(true);
+      dispatch_barrier_active_ = true;
+    }
+
+    // Move out before calling the splitter. Splitter implementations may satisfy a request
+    // locally without taking ownership of the rvalue parameter.
+    Common::Redis::RespValuePtr value = std::move(pending->pending_request_value_);
+    processRespValue(std::move(value), *pending);
+    if (dispatch_barrier_active_) {
+      return;
+    }
+  }
+}
+
+void ProxyFilter::setDispatchBlocked(bool blocked) {
+  if (dispatch_blocked_ == blocked) {
+    return;
+  }
+  dispatch_blocked_ = blocked;
+  // Stop additional downstream reads while a blocking command is active or waiting behind prior
+  // work. The decoder may finish the current network buffer, but connection backpressure prevents
+  // an indefinite BLPOP/BRPOP from accumulating unbounded future reads.
+  callbacks_->connection().readDisable(blocked);
 }
 
 void ProxyFilter::onEvent(Network::ConnectionEvent event) {
@@ -202,11 +271,8 @@ void ProxyFilter::onAuthenticateExternal(CommandSplitter::SplitCallbacks& reques
 
   request.onResponse(std::move(redis_response));
 
-  // Resume processing of pending requests.
-  while (!pending_requests_.empty() && pending_requests_.front().pending_request_value_) {
-    processRespValue(std::move(pending_requests_.front().pending_request_value_),
-                     pending_requests_.front());
-  }
+  // Resume processing of pending requests unless a dispatch barrier is still active.
+  resumePendingRequests();
 }
 
 void ProxyFilter::onAuth(PendingRequest& request, const std::string& password) {
@@ -276,8 +342,12 @@ bool ProxyFilter::checkPassword(const std::string& password) {
 
 void ProxyFilter::onResponse(PendingRequest& request, Common::Redis::RespValuePtr&& value) {
   ASSERT(!pending_requests_.empty());
+  const bool completed_dispatch_barrier = request.blocks_downstream_dispatch_;
   request.pending_response_ = std::move(value);
   request.request_handle_ = nullptr;
+  if (completed_dispatch_barrier) {
+    dispatch_barrier_active_ = false;
+  }
 
   // The response we got might not be in order, so flush out what we can. (A new response may
   // unlock several out of order responses).
@@ -289,6 +359,10 @@ void ProxyFilter::onResponse(PendingRequest& request, Common::Redis::RespValuePt
   if (encoder_buffer_.length() > 0) {
     callbacks_->connection().write(encoder_buffer_, false);
   }
+
+  // A non-barrier response can make a queued barrier eligible to dispatch, and a barrier response
+  // can release queued later requests.
+  resumePendingRequests();
 
   if (pending_requests_.empty() && connection_quit_) {
     callbacks_->connection().close(Network::ConnectionCloseType::FlushWrite);

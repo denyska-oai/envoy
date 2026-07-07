@@ -843,6 +843,148 @@ TEST_F(RedisClientImplTest, OpTimeout) {
   EXPECT_EQ(0UL, host_->cluster_.traffic_stats_->upstream_rq_active_.value());
 }
 
+TEST_F(RedisClientImplTest, RequestScopedOpTimeout) {
+  InSequence s;
+
+  setup();
+
+  Common::Redis::RespValue request;
+  MockClientCallbacks callbacks;
+  EXPECT_CALL(*encoder_, encode(Ref(request), _));
+  EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
+  Client::RequestOptions options =
+      Client::RequestOptions::withOpTimeout(std::chrono::milliseconds(1234));
+  PoolRequest* handle = client_->makeRequest(request, callbacks, options);
+  EXPECT_NE(nullptr, handle);
+
+  EXPECT_CALL(*connect_or_op_timer_, enableTimer(std::chrono::milliseconds(1234), _));
+  upstream_connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  EXPECT_CALL(callbacks, onResponse_(_));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(*upstream_connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  client_->close();
+}
+
+TEST_F(RedisClientImplTest, DisabledRequestOpTimeoutPreservesConnectTimeout) {
+  InSequence s;
+
+  setup();
+
+  Common::Redis::RespValue request;
+  MockClientCallbacks callbacks;
+  EXPECT_CALL(*encoder_, encode(Ref(request), _));
+  EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
+  PoolRequest* handle =
+      client_->makeRequest(request, callbacks, Client::RequestOptions::disableOpTimeout());
+  EXPECT_NE(nullptr, handle);
+
+  // The constructor's connect timeout remains armed until the connection event. Only then is the
+  // operation timer disabled for Redis timeout=0 semantics.
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  upstream_connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  EXPECT_CALL(callbacks, onResponse_(_));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(*upstream_connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  client_->close();
+}
+
+TEST_F(RedisClientImplTest, DisabledRequestOpTimeoutWaitsForAuthPrelude) {
+  InSequence s;
+
+  setup();
+
+  Common::Redis::RespValue request;
+  MockClientCallbacks callbacks;
+  EXPECT_CALL(*encoder_, encode(_, _));
+  EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
+  client_->initialize("", "password");
+  EXPECT_CALL(*encoder_, encode(Ref(request), _));
+  EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
+  PoolRequest* handle =
+      client_->makeRequest(request, callbacks, Client::RequestOptions::disableOpTimeout());
+  EXPECT_NE(nullptr, handle);
+
+  // AUTH is still at the front of the response queue, so it keeps the normal operation timeout.
+  EXPECT_CALL(*connect_or_op_timer_, enableTimer(std::chrono::milliseconds(20), _));
+  upstream_connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  // After AUTH completes, the indefinite blocking request becomes the front request and disables
+  // only the operation timer.
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(callbacks, onResponse_(_));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(*upstream_connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  client_->close();
+}
+
+TEST_F(RedisClientImplTest, DisabledRequestOpTimeoutWaitsForQueuedImmediateAuth) {
+  InSequence s;
+
+  setup();
+
+  // Model the AWS IAM path: application requests are queued while credentials are fetched, then
+  // AUTH is written immediately ahead of the buffered application request.
+  ClientImpl* client_impl = dynamic_cast<ClientImpl*>(client_.get());
+  ASSERT_NE(nullptr, client_impl);
+  client_impl->queueRequests(true);
+  Common::Redis::RespValue request;
+  MockClientCallbacks callbacks;
+  EXPECT_CALL(*encoder_, encode(Ref(request), _));
+  PoolRequest* handle =
+      client_->makeRequest(request, callbacks, Client::RequestOptions::disableOpTimeout());
+  EXPECT_NE(nullptr, handle);
+
+  EXPECT_CALL(*connect_or_op_timer_, enableTimer(std::chrono::milliseconds(20), _));
+  upstream_connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  Common::Redis::RespValue auth_request;
+  MockClientCallbacks auth_callbacks;
+  EXPECT_CALL(*encoder_, encode(Ref(auth_request), _));
+  EXPECT_CALL(*upstream_connection_, write(_, false));
+  EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
+  EXPECT_CALL(*upstream_connection_, write(_, false));
+  client_impl->makeRequestImmediate(auth_request, auth_callbacks);
+  client_impl->queueRequests(false);
+
+  // The immediate AUTH callback must be first even though the blocking request was queued first.
+  EXPECT_CALL(auth_callbacks, onResponse_(_));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(callbacks, onResponse_(_));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  EXPECT_CALL(host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestSuccess, _));
+  respond();
+
+  EXPECT_CALL(*upstream_connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(*connect_or_op_timer_, disableTimer());
+  client_->close();
+}
+
 TEST_F(RedisClientImplTest, AskRedirection) {
   InSequence s;
 

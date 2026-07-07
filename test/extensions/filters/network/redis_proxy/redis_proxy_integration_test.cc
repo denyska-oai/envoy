@@ -1,3 +1,4 @@
+#include <chrono>
 #include <sstream>
 #include <vector>
 
@@ -44,12 +45,20 @@ static_resources:
         cluster_name: cluster_0
         endpoints:
           - lb_endpoints:
-            - endpoint:
+            - metadata:
+                filter_metadata:
+                  envoy.filters.network.redis_proxy:
+                    shard_index: 0
+              endpoint:
                 address:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 0
-            - endpoint:
+            - metadata:
+                filter_metadata:
+                  envoy.filters.network.redis_proxy:
+                    shard_index: 1
+              endpoint:
                 address:
                   socket_address:
                     address: 127.0.0.1
@@ -77,6 +86,12 @@ static_resources:
 // This is a configuration with command stats enabled.
 const std::string CONFIG_WITH_COMMAND_STATS = CONFIG + R"EOF(
             enable_command_stats: true
+)EOF";
+
+const std::string CONFIG_WITH_STATIC_SHARD_ROUTING = CONFIG + R"EOF(
+            enable_hashtagging: true
+            static_shard_routing:
+              shard_count: 2
 )EOF";
 
 // This is a configuration with moved/ask redirection support enabled.
@@ -858,6 +873,12 @@ public:
       : RedisProxyIntegrationTest(CONFIG_WITH_COMMAND_STATS, 2) {}
 };
 
+class RedisProxyWithStaticShardRoutingIntegrationTest : public RedisProxyIntegrationTest {
+public:
+  RedisProxyWithStaticShardRoutingIntegrationTest()
+      : RedisProxyIntegrationTest(CONFIG_WITH_STATIC_SHARD_ROUTING, 2) {}
+};
+
 class RedisProxyWithFaultInjectionIntegrationTest : public RedisProxyIntegrationTest {
 public:
   RedisProxyWithFaultInjectionIntegrationTest()
@@ -997,6 +1018,10 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, RedisProxyWithMirrorsIntegrationTest,
                          TestUtility::ipTestParamsToString);
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, RedisProxyWithCommandStatsIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, RedisProxyWithStaticShardRoutingIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
 
@@ -1278,6 +1303,114 @@ TEST_P(RedisProxyIntegrationTest, KEYSRequestAndResponse) {
 
   // Cleanup
   EXPECT_TRUE(fake_upstream_connection->close());
+  redis_client->close();
+}
+
+TEST_P(RedisProxyWithStaticShardRoutingIntegrationTest, ScriptLoadFansOutToAllStaticUpstreams) {
+  initialize();
+  const std::string request = makeBulkStringArray({"script", "load", "return 1"});
+  const std::string response = "$3\r\nsha\r\n";
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  ASSERT_TRUE(redis_client->write(request));
+
+  std::vector<FakeRawConnectionPtr> upstream_connections(num_upstreams_);
+  for (int i = 0; i < num_upstreams_; ++i) {
+    expectUpstreamRequestResponse(fake_upstreams_[i], request, response, upstream_connections[i]);
+  }
+
+  redis_client->waitForData(response);
+  EXPECT_EQ(response, redis_client->data());
+
+  for (auto& upstream_connection : upstream_connections) {
+    EXPECT_TRUE(upstream_connection->close());
+  }
+  redis_client->close();
+}
+
+TEST_P(RedisProxyWithStaticShardRoutingIntegrationTest, KeyedRequestsUseHashtagAndMetadataOrdinal) {
+  initialize();
+
+  // These tunnel tags have stable XXH32(seed=0) parity: all-zero routes to 0 and all-one to 1.
+  const std::string shard_zero_request = makeBulkStringArray(
+      {"set", "tunnel_queue:{tunnel:tunnel_00000000000000000000000000000000}:pending", "a"});
+  const std::string shard_one_request = makeBulkStringArray(
+      {"set", "tunnel_queue:{tunnel:tunnel_11111111111111111111111111111111}:pending", "b"});
+  const std::string response = "+OK\r\n";
+
+  simpleRoundtripToUpstream(fake_upstreams_[0], shard_zero_request, response);
+  simpleRoundtripToUpstream(fake_upstreams_[1], shard_one_request, response);
+}
+
+TEST_P(RedisProxyWithStaticShardRoutingIntegrationTest,
+       EvalShardStripsOrdinalAndTargetsFixedShard) {
+  initialize();
+
+  const std::string downstream_request = makeBulkStringArray({"eval.shard", "1", "return 1", "0"});
+  const std::string upstream_request = makeBulkStringArray({"eval", "return 1", "0"});
+  const std::string response = ":1\r\n";
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  ASSERT_TRUE(redis_client->write(downstream_request));
+
+  FakeRawConnectionPtr upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[1]->waitForRawConnection(upstream_connection));
+  std::string proxy_to_server;
+  ASSERT_TRUE(upstream_connection->waitForData(upstream_request.size(), &proxy_to_server));
+  EXPECT_EQ(upstream_request, proxy_to_server);
+  ASSERT_TRUE(upstream_connection->write(response));
+
+  redis_client->waitForData(response);
+  EXPECT_EQ(response, redis_client->data());
+  EXPECT_TRUE(upstream_connection->close());
+  redis_client->close();
+}
+
+TEST_P(RedisProxyWithStaticShardRoutingIntegrationTest,
+       BlockingPopWaitsForEarlierRequestAndQueuesLaterRequest) {
+  initialize();
+
+  const std::string key = "tunnel_queue:{tunnel:tunnel_00000000000000000000000000000000}:pending";
+  const std::string lpush_request = makeBulkStringArray({"lpush", key, "value"});
+  const std::string blpop_request = makeBulkStringArray({"blpop", key, "1"});
+  const std::string ping_request = makeBulkStringArray({"ping"});
+  const std::string lpush_response = ":1\r\n";
+  const std::string blpop_response =
+      "*2\r\n$" + std::to_string(key.size()) + "\r\n" + key + "\r\n$5\r\nvalue\r\n";
+  const std::string downstream_response = lpush_response + blpop_response + "+PONG\r\n";
+
+  IntegrationTcpClientPtr redis_client = makeTcpConnection(lookupPort("redis_proxy"));
+  ASSERT_TRUE(redis_client->write(lpush_request + blpop_request + ping_request));
+
+  FakeRawConnectionPtr shared_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(shared_connection));
+  std::string proxy_to_server;
+  ASSERT_TRUE(shared_connection->waitForData(lpush_request.size(), &proxy_to_server));
+  EXPECT_EQ(lpush_request, proxy_to_server);
+
+  // BLPOP uses another connection, but it must not be opened until LPUSH has completed.
+  FakeRawConnectionPtr premature_exclusive_connection;
+  EXPECT_FALSE(fake_upstreams_[0]->waitForRawConnection(premature_exclusive_connection,
+                                                        std::chrono::milliseconds(50)));
+
+  ASSERT_TRUE(shared_connection->write(lpush_response));
+  redis_client->waitForData(lpush_response);
+  EXPECT_EQ(lpush_response, redis_client->data());
+
+  FakeRawConnectionPtr exclusive_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(exclusive_connection));
+  proxy_to_server.clear();
+  ASSERT_TRUE(exclusive_connection->waitForData(blpop_request.size(), &proxy_to_server));
+  EXPECT_EQ(blpop_request, proxy_to_server);
+
+  // PING is local to Envoy, but it still must not overtake the blocking pop response.
+  EXPECT_EQ(lpush_response, redis_client->data());
+  ASSERT_TRUE(exclusive_connection->write(blpop_response));
+  redis_client->waitForData(downstream_response);
+  EXPECT_EQ(downstream_response, redis_client->data());
+
+  EXPECT_TRUE(shared_connection->close());
+  EXPECT_TRUE(exclusive_connection->close());
   redis_client->close();
 }
 

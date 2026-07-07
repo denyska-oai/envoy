@@ -63,6 +63,8 @@ public:
     return static_cast<MockFaultManager*>(fault_manager_ptr);
   }
 
+  MockRouter& router() { return *static_cast<MockRouter*>(splitter_.router_.get()); }
+
   InstanceImpl getSplitter(absl::flat_hash_set<std::string>&& custom_commands) {
     return InstanceImpl{std::make_unique<NiceMock<MockRouter>>(route_),
                         *store_.rootScope(),
@@ -761,6 +763,99 @@ TEST_F(RedisSingleServerRequestTest, EvalNoUpstream) {
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.eval.total").value());
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.eval.error").value());
 };
+
+TEST_F(RedisSingleServerRequestTest, BlockingPopUsesExclusivePoolPath) {
+  InSequence s;
+
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {"BLPOP", "key", "1.25"});
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, makeBlockingRequest_("key", RespVariantEq(*request), _,
+                                                std::chrono::milliseconds(1250)))
+      .WillOnce(DoAll(WithArg<2>(SaveArgAddress(&pool_callbacks_)), Return(&pool_request_)));
+
+  handle_ = splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
+  ASSERT_NE(nullptr, handle_);
+  EXPECT_TRUE(handle_->blocksDownstreamDispatch());
+
+  Common::Redis::RespValuePtr response(new Common::Redis::RespValue());
+  Common::Redis::RespValue* response_ptr = response.get();
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(response_ptr)));
+  pool_callbacks_->onResponse(std::move(response));
+
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command.blpop.total").value());
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command.blpop.success").value());
+}
+
+TEST_F(RedisSingleServerRequestTest, BlockingPopRequiresPreDispatchBarrier) {
+  Common::Redis::RespValue blocking_request;
+  makeBulkStringArray(blocking_request, {"BLPOP", "key", "1"});
+  EXPECT_TRUE(splitter_.requiresDownstreamDispatchBarrier(blocking_request));
+
+  Common::Redis::RespValue regular_request;
+  makeBulkStringArray(regular_request, {"GET", "key"});
+  EXPECT_FALSE(splitter_.requiresDownstreamDispatchBarrier(regular_request));
+}
+
+TEST_F(RedisSingleServerRequestTest, BlockingPopAllowsInfiniteTimeout) {
+  InSequence s;
+
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {"brpop", "key", "0"});
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, makeBlockingRequest_("key", RespVariantEq(*request), _,
+                                                std::chrono::milliseconds::zero()))
+      .WillOnce(Return(&pool_request_));
+  handle_ = splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
+  ASSERT_NE(nullptr, handle_);
+  EXPECT_TRUE(handle_->blocksDownstreamDispatch());
+
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command.brpop.total").value());
+  EXPECT_EQ(0UL, store_.counter("redis.foo.command.brpop.error").value());
+
+  EXPECT_CALL(pool_request_, cancel());
+  handle_->cancel();
+}
+
+TEST_F(RedisSingleServerRequestTest, BlockingPopRejectsMultipleKeys) {
+  InSequence s;
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = "ERR Envoy Redis proxy supports exactly one key for BLPOP and BRPOP";
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {"blpop", "key-one", "key-two", "1"});
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command.blpop.total").value());
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command.blpop.error").value());
+}
+
+TEST_F(RedisSingleServerRequestTest, BlockingPopRejectsInvalidTimeouts) {
+  const auto expect_invalid_timeout = [this](absl::string_view timeout) {
+    Common::Redis::RespValue response;
+    response.type(Common::Redis::RespType::Error);
+    response.asString() = "ERR timeout is not a finite non-negative number";
+    EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+    EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+
+    Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+    makeBulkStringArray(*request, {"blpop", "key", std::string(timeout)});
+    EXPECT_EQ(nullptr,
+              splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+  };
+
+  expect_invalid_timeout("-1");
+  expect_invalid_timeout("nan");
+  expect_invalid_timeout("1e100");
+
+  EXPECT_EQ(3UL, store_.counter("redis.foo.command.blpop.total").value());
+  EXPECT_EQ(3UL, store_.counter("redis.foo.command.blpop.error").value());
+}
 
 // OBJECT command tests - hashes on the third argument (index 2)
 TEST_F(RedisSingleServerRequestTest, ObjectEncodingSuccess) {
@@ -1990,14 +2085,178 @@ TEST_F(InfoShardHandlerTest, InfoShardNoUpstreamForShard) {
   EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&expected_response)));
 
   handle_ = splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
-  // Even though we get an error, a request object is returned (onResponse is called immediately)
-  EXPECT_NE(nullptr, handle_);
+  // A configured-but-unavailable static ordinal responds synchronously. Do not return a split
+  // handle after the callback may have removed the proxy filter's pending request.
+  EXPECT_EQ(nullptr, handle_);
 
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.info.shard.total").value());
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.info.shard.error").value());
 }
 
 INSTANTIATE_TEST_SUITE_P(InfoShardHandlerTest, InfoShardHandlerTest, testing::Values("info.shard"));
+
+// EVAL[SHA].SHARD command handler tests - execute a script on one specific shard.
+class EvalShardHandlerTest : public FragmentedRequestCommandHandlerTest,
+                             public testing::WithParamInterface<std::string> {};
+
+TEST_P(EvalShardHandlerTest, RoutesAndStripsShardArgument) {
+  InSequence s;
+
+  const std::string command = GetParam();
+  const std::string upstream_command = command == "eval.shard" ? "eval" : "evalsha";
+  const std::string script_or_sha = command == "eval.shard" ? "return {1, 2, 3}" : "deadbeef";
+
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {command, "1", script_or_sha, "3", "stats:ready", "stats:inflight",
+                                 "stats:active", "1234"});
+
+  Common::Redis::RespValue expected_upstream_request;
+  makeBulkStringArray(expected_upstream_request,
+                      {upstream_command, script_or_sha, "3", "stats:ready", "stats:inflight",
+                       "stats:active", "1234"});
+
+  pool_callbacks_.resize(1);
+  std::vector<Common::Redis::Client::MockPoolRequest> tmp_pool_requests(1);
+  pool_requests_.swap(tmp_pool_requests);
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, shardSize_()).WillOnce(Return(2));
+  EXPECT_CALL(*conn_pool_, makeRequestToShard_(1, RespValueVariantEq(expected_upstream_request), _))
+      .WillOnce(DoAll(WithArg<2>(SaveArgAddress(&pool_callbacks_[0])), Return(&pool_requests_[0])));
+
+  handle_ = splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
+  EXPECT_NE(nullptr, handle_);
+
+  Common::Redis::RespValuePtr response = std::make_unique<Common::Redis::RespValue>();
+  response->type(Common::Redis::RespType::Array);
+  response->asArray().resize(3);
+  for (uint64_t i = 0; i < response->asArray().size(); i++) {
+    response->asArray()[i].type(Common::Redis::RespType::Integer);
+    response->asArray()[i].asInteger() = i + 1;
+  }
+  Common::Redis::RespValue expected_response = *response;
+
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&expected_response)));
+  pool_callbacks_[0]->onResponse(std::move(response));
+
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command." + command + ".total").value());
+  EXPECT_EQ(1UL, store_.counter("redis.foo.command." + command + ".success").value());
+}
+
+TEST_P(EvalShardHandlerTest, ForwardsPrefixRouteKeyMutation) {
+  InSequence s;
+
+  const std::string command = GetParam();
+  const std::string upstream_command = command == "eval.shard" ? "eval" : "evalsha";
+  const std::string script_or_sha = command == "eval.shard" ? "return KEYS[1]" : "deadbeef";
+
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {command, "0", script_or_sha, "1", "prefix:key"});
+
+  Common::Redis::RespValue expected_upstream_request;
+  makeBulkStringArray(expected_upstream_request,
+                      {upstream_command, script_or_sha, "1", "rewritten-key"});
+
+  pool_callbacks_.resize(1);
+  std::vector<Common::Redis::Client::MockPoolRequest> tmp_pool_requests(1);
+  pool_requests_.swap(tmp_pool_requests);
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(router(), upstreamPool(_, _))
+      .WillOnce(Invoke([this](std::string& key, const StreamInfo::StreamInfo&) -> RouteSharedPtr {
+        EXPECT_EQ("prefix:key", key);
+        key = "rewritten-key";
+        return route_;
+      }));
+  EXPECT_CALL(*conn_pool_, shardSize_()).WillOnce(Return(2));
+  EXPECT_CALL(*conn_pool_, makeRequestToShard_(0, RespValueVariantEq(expected_upstream_request), _))
+      .WillOnce(DoAll(WithArg<2>(SaveArgAddress(&pool_callbacks_[0])), Return(&pool_requests_[0])));
+
+  handle_ = splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
+  ASSERT_NE(nullptr, handle_);
+
+  Common::Redis::RespValuePtr response = std::make_unique<Common::Redis::RespValue>();
+  Common::Redis::RespValue expected_response = *response;
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&expected_response)));
+  pool_callbacks_[0]->onResponse(std::move(response));
+}
+
+TEST_P(EvalShardHandlerTest, InvalidShardId) {
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {GetParam(), "not-a-number", "return 1", "0"});
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = "ERR invalid shard_id - must be a numeric shard index";
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+}
+
+TEST_P(EvalShardHandlerTest, WrongNumberOfArguments) {
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {GetParam(), "0", "return 1"});
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = fmt::format("wrong number of arguments for '{}' command", GetParam());
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+}
+
+TEST_P(EvalShardHandlerTest, NoAvailableShards) {
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {GetParam(), "0", "return 1", "0"});
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = Response::get().NoUpstreamHost;
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, shardSize_()).WillOnce(Return(0));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+}
+
+TEST_P(EvalShardHandlerTest, OutOfRangeShardId) {
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {GetParam(), "2", "return 1", "0"});
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = "ERR shard_id 2 out of range (0-1)";
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, shardSize_()).WillOnce(Return(2));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+}
+
+TEST_P(EvalShardHandlerTest, NoUpstreamForShard) {
+  Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
+  makeBulkStringArray(*request, {GetParam(), "0", "return 1", "0"});
+
+  Common::Redis::RespValue response;
+  response.type(Common::Redis::RespType::Error);
+  response.asString() = Response::get().NoUpstreamHost;
+
+  EXPECT_CALL(callbacks_, connectionAllowed()).WillOnce(Return(true));
+  EXPECT_CALL(*conn_pool_, shardSize_()).WillOnce(Return(2));
+  EXPECT_CALL(*conn_pool_, makeRequestToShard_(0, _, _)).WillOnce(Return(nullptr));
+  EXPECT_CALL(callbacks_, onResponse_(PointeesEq(&response)));
+  EXPECT_EQ(nullptr,
+            splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_));
+}
+
+INSTANTIATE_TEST_SUITE_P(EvalShardHandlerTest, EvalShardHandlerTest,
+                         testing::Values("eval.shard", "evalsha.shard"));
 
 // Test cluster scope commands - ROLE (ArrayAppendAggregateResponseHandler)
 class ClusterScopeRoleTest : public FragmentedRequestCommandHandlerTest {
@@ -2326,12 +2585,9 @@ TEST_F(RandomShardRequestTest, MakeRequestToShardReturnsNull) {
   // We expect an error response when the handle is null (this happens during setup)
   EXPECT_CALL(callbacks_, onResponse_(_));
 
-  setup({"randomkey"}, {0});   // Setup with null_handle_indexes = {0} to mock null handle
-  EXPECT_NE(nullptr, handle_); // Request object is created and returned
-
-  // The pending request should receive a NoUpstreamHost error response automatically
-  // when makeFragmentedRequestToShard returns null, but since we have 1 pending response,
-  // the request_ptr is still returned (not nullptr)
+  setup({"randomkey"}, {0}); // Setup with null_handle_indexes = {0} to mock null handle
+  // The pending request receives NoUpstreamHost synchronously, so no stale split handle remains.
+  EXPECT_EQ(nullptr, handle_);
 
   // Verify the error counter is incremented due to the null handle
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.randomkey.total").value());
@@ -2526,11 +2782,12 @@ TEST_F(HelloRequestTest, HelloResponseWithoutIdField) {
 }
 
 TEST_F(HelloRequestTest, HelloMakeRequestToShardReturnsNull) {
-  // Test case where makeFragmentedRequestToShard returns null
+  // A configured shard can be unavailable in static mode. If every cluster-scope shard request
+  // completes synchronously with no host, the splitter must not return a stale handle.
   EXPECT_CALL(callbacks_, onResponse_(_));
 
   setup({"hello", "2"}, {0}, false, 1); // null_handle_indexes = {0}
-  EXPECT_NE(nullptr, handle_);
+  EXPECT_EQ(nullptr, handle_);
 
   EXPECT_EQ(1UL, store_.counter("redis.foo.command.hello.total").value());
 }

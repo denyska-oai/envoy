@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
@@ -74,6 +75,40 @@ public:
  */
 class Client : public Event::DeferredDeletable {
 public:
+  /**
+   * Request-scoped operation timeout behavior.
+   *
+   * The connect timeout still applies until the upstream connection is ready. Disabling the
+   * operation timeout only affects an established connection while this request is at the front
+   * of the response queue.
+   */
+  struct RequestOptions {
+    enum class OpTimeoutMode {
+      // Use the pool's configured operation timeout.
+      UseDefault,
+      // Use op_timeout_ for this request only.
+      Override,
+      // Do not arm an operation timer once connection initialization is complete.
+      Disabled,
+    };
+
+    static RequestOptions withOpTimeout(std::chrono::milliseconds timeout) {
+      RequestOptions options;
+      options.op_timeout_mode_ = OpTimeoutMode::Override;
+      options.op_timeout_ = timeout;
+      return options;
+    }
+
+    static RequestOptions disableOpTimeout() {
+      RequestOptions options;
+      options.op_timeout_mode_ = OpTimeoutMode::Disabled;
+      return options;
+    }
+
+    OpTimeoutMode op_timeout_mode_{OpTimeoutMode::UseDefault};
+    std::chrono::milliseconds op_timeout_{};
+  };
+
   ~Client() override = default;
 
   /**
@@ -82,10 +117,20 @@ public:
   virtual void addConnectionCallbacks(Network::ConnectionCallbacks& callbacks) PURE;
 
   /**
+   * Removes network connection callbacks from the underlying network connection.
+   */
+  virtual void removeConnectionCallbacks(Network::ConnectionCallbacks& callbacks) PURE;
+
+  /**
    * Called to determine if the client has pending requests.
    * @return bool true if the client is processing requests or false if it is currently idle.
    */
   virtual bool active() PURE;
+
+  /**
+   * @return true while the underlying network connection can accept another request.
+   */
+  virtual bool isOpen() const PURE;
 
   /**
    * Closes the underlying network connection.
@@ -100,6 +145,15 @@ public:
    *         for some reason.
    */
   virtual PoolRequest* makeRequest(const RespValue& request, ClientCallbacks& callbacks) PURE;
+
+  /**
+   * Make a pipelined request with request-scoped behavior such as a longer operation deadline.
+   * Implementations that do not support request options fall back to the default request path.
+   */
+  virtual PoolRequest* makeRequest(const RespValue& request, ClientCallbacks& callbacks,
+                                   const RequestOptions&) {
+    return makeRequest(request, callbacks);
+  }
 
   /**
    * Initialize the connection. Issue the auth command and readonly command as needed.

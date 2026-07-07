@@ -198,6 +198,65 @@ settings:
                           "ConnectionRateLimitPerSec: value must be greater than 0");
 }
 
+TEST(RedisProxyFilterConfigFactoryTest, ValidBlockingCommandSettings) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  blocking_command_settings:
+    max_active_connections_per_host: 1
+    max_idle_connections_per_host: 0
+  )EOF";
+
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+}
+
+TEST(RedisProxyFilterConfigFactoryTest, InvalidBlockingCommandActiveConnectionLimit) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  blocking_command_settings:
+    max_active_connections_per_host: 0
+  )EOF";
+
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  EXPECT_THROW_WITH_REGEX(TestUtility::loadFromYamlAndValidate(yaml, proto_config),
+                          ProtoValidationException,
+                          "MaxActiveConnectionsPerHost: value must be greater than 0");
+}
+
+TEST(RedisProxyFilterConfigFactoryTest, StaticShardRoutingRejectsRedirection) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  enable_redirection: true
+  static_shard_routing:
+    shard_count: 2
+  )EOF";
+
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+
+  EXPECT_THROW_WITH_MESSAGE(RedisProxyFilterConfigFactory()
+                                .createFilterFactoryFromProto(proto_config, context)
+                                .IgnoreError(),
+                            EnvoyException,
+                            "static_shard_routing cannot be combined with enable_redirection");
+}
+
 // Verify async gRPC client is created if external auth is enabled.
 TEST(RedisProxyFilterConfigFactoryTest, ExternalAuthProvider) {
   const std::string yaml = R"EOF(

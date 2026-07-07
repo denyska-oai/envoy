@@ -3,6 +3,14 @@
 #include "gtest/gtest.h"
 
 namespace Envoy {
+TEST(Hash, xxHash32) {
+  EXPECT_EQ(3792637401U, HashUtil::xxHash32("foo"));
+  EXPECT_EQ(1101146924U, HashUtil::xxHash32("bar"));
+  EXPECT_EQ(2771808023U, HashUtil::xxHash32("foo\nbar"));
+  EXPECT_EQ(1368010247U, HashUtil::xxHash32("lyft"));
+  EXPECT_EQ(46947589U, HashUtil::xxHash32(""));
+}
+
 TEST(Hash, xxHash) {
   EXPECT_EQ(3728699739546630719U, HashUtil::xxHash64("foo"));
   EXPECT_EQ(5234164152756840025U, HashUtil::xxHash64("bar"));

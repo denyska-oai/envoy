@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "source/extensions/filters/network/redis_proxy/conn_pool.h"
 
 #include "absl/container/node_hash_map.h"
+#include "absl/container/node_hash_set.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -40,13 +42,20 @@ namespace ConnPool {
 // TODO(mattklein123): Circuit breaking
 // TODO(rshriram): Fault injection
 
-#define REDIS_CLUSTER_STATS(COUNTER)                                                               \
+#define REDIS_CLUSTER_STATS(COUNTER, GAUGE)                                                        \
   COUNTER(upstream_cx_drained)                                                                     \
   COUNTER(max_upstream_unknown_connections_reached)                                                \
-  COUNTER(connection_rate_limited)
+  COUNTER(connection_rate_limited)                                                                 \
+  COUNTER(exclusive_cx_created)                                                                    \
+  COUNTER(exclusive_cx_drained)                                                                    \
+  COUNTER(exclusive_cx_limit_reached)                                                              \
+  COUNTER(exclusive_cx_retired)                                                                    \
+  COUNTER(exclusive_cx_reused)                                                                     \
+  GAUGE(exclusive_cx_active, Accumulate)                                                           \
+  GAUGE(exclusive_cx_idle, Accumulate)
 
 struct RedisClusterStats {
-  REDIS_CLUSTER_STATS(GENERATE_COUNTER_STRUCT)
+  REDIS_CLUSTER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 
 class DoNothingPoolCallbacks : public PoolCallbacks {
@@ -75,6 +84,9 @@ public:
   Common::Redis::Client::PoolRequest*
   makeRequest(const std::string& key, RespVariant&& request, PoolCallbacks& callbacks,
               Common::Redis::Client::Transaction& transaction) override;
+  Common::Redis::Client::PoolRequest*
+  makeBlockingRequest(const std::string& key, RespVariant&& request, PoolCallbacks& callbacks,
+                      std::chrono::milliseconds blocking_timeout) override;
   Common::Redis::Client::PoolRequest*
   makeRequestToShard(uint16_t shard_index, RespVariant&& request, PoolCallbacks& callbacks,
                      Common::Redis::Client::Transaction& transaction) override;
@@ -114,6 +126,29 @@ private:
 
   using ThreadLocalActiveClientPtr = std::unique_ptr<ThreadLocalActiveClient>;
 
+  // An exclusive client lease is checked out by one downstream request at a time. Clean
+  // completions return the client to a per-host idle list; cancellation and failures retire it.
+  struct ExclusiveClientLease : public Event::DeferredDeletable,
+                                public Network::ConnectionCallbacks {
+    explicit ExclusiveClientLease(ThreadLocalPool& parent) : parent_(parent) {}
+
+    // Network::ConnectionCallbacks. These callbacks are installed only while the lease is idle,
+    // so an idle remote close can remove the lease and correct its gauge immediately.
+    void onEvent(Network::ConnectionEvent event) override;
+    void onAboveWriteBufferHighWatermark() override {}
+    void onBelowWriteBufferLowWatermark() override {}
+
+    ThreadLocalPool& parent_;
+    Upstream::HostConstSharedPtr host_;
+    Common::Redis::Client::ClientPtr redis_client_;
+    // Set when the selected host leaves the cluster. The in-flight Redis command is allowed to
+    // finish, but the lease must be retired rather than returned to the idle cache.
+    bool draining_{false};
+    bool idle_{false};
+  };
+
+  using ExclusiveClientLeasePtr = std::unique_ptr<ExclusiveClientLease>;
+
   struct PendingRequest
       : public Common::Redis::Client::ClientCallbacks,
         public Common::Redis::Client::PoolRequest,
@@ -139,12 +174,15 @@ private:
     std::string formatAddress(const Envoy::Network::Address::Ip& ip);
     void doRedirection(Common::Redis::RespValuePtr&& value, const std::string& host_address,
                        bool ask_redirection);
+    void releaseExclusiveClientLease(bool reusable);
+    bool hasExclusiveClientLease() const { return exclusive_client_lease_ != nullptr; }
 
     ThreadLocalPool& parent_;
     const RespVariant incoming_request_;
-    Common::Redis::Client::PoolRequest* request_handler_;
+    Common::Redis::Client::PoolRequest* request_handler_{};
     PoolCallbacks& pool_callbacks_;
     Upstream::HostConstSharedPtr host_;
+    ExclusiveClientLeasePtr exclusive_client_lease_;
     Common::Redis::RespValuePtr resp_value_;
     bool ask_redirection_;
     Extensions::Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryHandlePtr
@@ -163,10 +201,23 @@ private:
             aws_iam_authenticator);
     ~ThreadLocalPool() override;
     ThreadLocalActiveClientPtr& threadLocalActiveClient(Upstream::HostConstSharedPtr host);
+    ExclusiveClientLeasePtr acquireExclusiveClientLease(Upstream::HostConstSharedPtr host);
+    bool activateExclusiveClientLease(ExclusiveClientLease& lease);
+    void deactivateExclusiveClientLease(ExclusiveClientLease& lease);
+    void releaseExclusiveClientLease(ExclusiveClientLeasePtr&& lease);
+    void retireExclusiveClientLease(ExclusiveClientLeasePtr&& lease);
+    void onIdleExclusiveClientLeaseClosed(ExclusiveClientLease& lease);
+    void drainExclusiveClientLeases(Upstream::HostConstSharedPtr host);
+    void drainAllExclusiveClientLeases();
+    void closeIdleExclusiveClientLeases(Upstream::HostConstSharedPtr host);
+    void closeAllIdleExclusiveClientLeases();
     uint16_t shardSize();
     Common::Redis::Client::PoolRequest*
     makeRequest(const std::string& key, RespVariant&& request, PoolCallbacks& callbacks,
                 Common::Redis::Client::Transaction& transaction);
+    Common::Redis::Client::PoolRequest*
+    makeBlockingRequest(const std::string& key, RespVariant&& request, PoolCallbacks& callbacks,
+                        std::chrono::milliseconds blocking_timeout);
     Common::Redis::Client::PoolRequest*
     makeRequestToHost(Upstream::HostConstSharedPtr& host, RespVariant&& request,
                       PoolCallbacks& callbacks, Common::Redis::Client::Transaction& transaction);
@@ -176,6 +227,10 @@ private:
     Common::Redis::Client::PoolRequest*
     makeRequestToShard(uint16_t shard_index, RespVariant&& request, PoolCallbacks& callbacks,
                        Common::Redis::Client::Transaction& transaction);
+    bool staticShardRoutingEnabled() const;
+    std::optional<uint16_t> staticShardIndex(const Upstream::Host& host) const;
+    Upstream::HostConstSharedPtr staticShardHost(uint16_t shard_index) const;
+    void rebuildStaticShardHosts();
     void onClusterAddOrUpdateNonVirtual(absl::string_view cluster_name,
                                         Upstream::ThreadLocalClusterCommand& get_cluster);
     void onHostsAdded(const std::vector<Upstream::HostSharedPtr>& hosts_added);
@@ -199,6 +254,13 @@ private:
     Upstream::ClusterUpdateCallbacksHandlePtr cluster_update_handle_;
     Upstream::ThreadLocalCluster* cluster_{};
     absl::node_hash_map<Upstream::HostConstSharedPtr, ThreadLocalActiveClientPtr> client_map_;
+    absl::node_hash_map<Upstream::HostConstSharedPtr, std::list<ExclusiveClientLeasePtr>>
+        idle_exclusive_client_leases_;
+    // Active leases are owned by PendingRequest; this index only tracks their stable addresses so
+    // host removal can mark them non-reusable without taking ownership away from the request.
+    absl::node_hash_map<Upstream::HostConstSharedPtr, absl::node_hash_set<ExclusiveClientLease*>>
+        active_exclusive_client_leases_;
+    absl::node_hash_set<Upstream::HostConstSharedPtr> draining_exclusive_hosts_;
     absl::node_hash_map<Upstream::HostConstSharedPtr, TokenBucketPtr> cx_rate_limiter_map_;
     Envoy::Common::CallbackHandlePtr host_set_member_update_cb_handle_;
     absl::node_hash_map<std::string, Upstream::HostConstSharedPtr> host_address_map_;
@@ -207,6 +269,9 @@ private:
     std::list<Upstream::HostSharedPtr> created_via_redirect_hosts_;
     std::list<ThreadLocalActiveClientPtr> clients_to_drain_;
     std::list<PendingRequest> pending_requests_;
+    // Fixed by endpoint metadata rather than host order. Null entries deliberately remain null
+    // when an ordinal is missing or unavailable so other shards are never renumbered.
+    std::optional<std::vector<Upstream::HostConstSharedPtr>> static_shard_hosts_;
     /* This timer is used to poll the active clients in clients_to_drain_ to determine whether they
      * have been drained (have no active requests) or not. It is only enabled after a client has
      * been added to clients_to_drain_, and is only re-enabled as long as that list is not empty. A
@@ -215,6 +280,7 @@ private:
      */
     Event::TimerPtr drain_timer_;
     bool is_redis_cluster_{false};
+    const std::optional<uint16_t> static_shard_count_;
     Common::Redis::Client::ClientFactory& client_factory_;
     Common::Redis::Client::ConfigSharedPtr config_;
     Stats::ScopeSharedPtr stats_scope_;
@@ -225,6 +291,8 @@ private:
         aws_iam_authenticator_;
     std::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam> aws_iam_config_;
     std::string client_zone_; // Zone from node.locality.zone
+    const uint32_t max_active_exclusive_client_leases_per_host_;
+    const uint32_t max_idle_exclusive_client_leases_per_host_;
   };
 
   const std::string& localZone() const { return local_zone_; }
@@ -234,6 +302,7 @@ private:
   Common::Redis::Client::ClientFactory& client_factory_;
   ThreadLocal::SlotPtr tls_;
   Common::Redis::Client::ConfigSharedPtr config_;
+  const std::optional<uint16_t> static_shard_count_;
   Api::Api& api_;
   Stats::ScopeSharedPtr stats_scope_;
   Common::Redis::RedisCommandStatsSharedPtr redis_command_stats_;
@@ -243,6 +312,8 @@ private:
   std::optional<Common::Redis::AwsIamAuthenticator::AwsIamAuthenticatorSharedPtr>
       aws_iam_authenticator_;
   std::optional<envoy::extensions::filters::network::redis_proxy::v3::AwsIam> aws_iam_config_;
+  const uint32_t max_active_exclusive_client_leases_per_host_;
+  const uint32_t max_idle_exclusive_client_leases_per_host_;
   const std::string local_zone_; // Zone from node.locality.zone
 };
 

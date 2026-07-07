@@ -47,7 +47,8 @@ Configuration
 For filter configuration details, see the Redis proxy filter
 :ref:`configuration reference <config_network_filters_redis_proxy>`.
 
-The corresponding cluster definition should be configured with
+Unless :ref:`static_shard_routing <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.static_shard_routing>`
+is configured, the corresponding cluster definition should use
 :ref:`ring hash load balancing <envoy_v3_api_field_config.cluster.v3.Cluster.lb_policy>`.
 
 If :ref:`active health checking <arch_overview_health_checking>` is desired, the
@@ -60,6 +61,78 @@ If passive healthchecking is desired, also configure
 
 For the purposes of passive healthchecking, connect timeouts, command timeouts, and connection
 close map to 5xx. All other responses from Redis are counted as a success.
+
+.. _arch_overview_redis_static_shard_routing:
+
+Fixed shard routing
+-------------------
+
+Independent Redis instances that are already sharded by the application can use
+:ref:`static_shard_routing <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.static_shard_routing>`
+instead of a ring-hash load balancer. In this mode Envoy routes each key to
+``XXH32(hashtag(key)) % shard_count`` using seed 0 over the exact key or hash-tag bytes,
+and uses endpoint metadata to bind every upstream to an explicit, stable shard ordinal.
+
+This mode is intended for migrations where existing clients already use the same ``XXH32``
+placement. Envoy never derives an ordinal from discovery order and never compacts the shard map
+when an endpoint becomes unavailable. A missing, unhealthy, degraded, or excluded endpoint makes
+only that ordinal unavailable, rather than moving its keys to another Redis instance.
+
+Each endpoint in the single supported priority must have a unique
+``filter_metadata.envoy.filters.network.redis_proxy.shard_index`` value in
+``[0, shard_count)``. Endpoints may be distributed across localities. For example, the Redis
+cluster load assignment can bind two endpoints to ordinals 0 and 1:
+
+.. code-block:: yaml
+
+  load_assignment:
+    cluster_name: redis
+    endpoints:
+    - lb_endpoints:
+      - metadata:
+          filter_metadata:
+            envoy.filters.network.redis_proxy:
+              shard_index: 0
+        endpoint:
+          address:
+            socket_address:
+              address: redis-0
+              port_value: 6379
+      - metadata:
+          filter_metadata:
+            envoy.filters.network.redis_proxy:
+              shard_index: 1
+        endpoint:
+          address:
+            socket_address:
+              address: redis-1
+              port_value: 6379
+
+The corresponding Redis proxy connection-pool settings enable hash-tag extraction and select the
+same two-shard map:
+
+.. code-block:: yaml
+
+  settings:
+    enable_hashtagging: true
+    static_shard_routing:
+      shard_count: 2
+
+All Envoy instances behind the same load-balanced address must use the same ``shard_count``,
+``enable_hashtagging`` value, prefix-route behavior, and endpoint-to-``shard_index`` mapping.
+Rolling between incompatible configurations is unsafe because two Envoys could route the same key
+to different Redis instances. Divergent health views are safe for placement: an Envoy with an
+unhealthy ordinal fails that request instead of rerouting it.
+Changing ``shard_count`` or reassigning a ``shard_index`` is a data-placement migration,
+not a safe rolling configuration change.
+
+Fixed shard routing cannot be combined with a Redis Cluster upstream or with
+:ref:`enable_redirection <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>`.
+Following a ``MOVED`` or ``ASK`` response to an arbitrary host would escape the fixed ordinal map,
+so an invalid configuration fails closed rather than falling back to normal load-balancer routing.
+
+Cluster-scope commands such as ``SCRIPT LOAD`` enumerate these fixed ordinals. An unavailable
+ordinal fails the command instead of silently skipping a Redis instance.
 
 .. _arch_overview_redis_cluster_support:
 
@@ -95,6 +168,13 @@ Every Redis cluster has its own extra statistics tree rooted at *cluster.<name>.
 
   max_upstream_unknown_connections_reached, Counter, Total number of times that an upstream connection to an unknown host is not created after redirection having reached the connection pool's max_upstream_unknown_connections limit
   upstream_cx_drained, Counter, Total number of upstream connections drained of active requests before being closed
+  exclusive_cx_active, Gauge, Current number of active exclusive upstream connections used by blocking commands
+  exclusive_cx_idle, Gauge, Current number of idle reusable exclusive upstream connections
+  exclusive_cx_created, Counter, Total number of exclusive upstream connections created
+  exclusive_cx_reused, Counter, Total number of idle exclusive upstream connections reused
+  exclusive_cx_retired, Counter, Total number of exclusive upstream connections retired after close or an unsafe state
+  exclusive_cx_drained, Counter, Total number of exclusive upstream connections drained after host churn
+  exclusive_cx_limit_reached, Counter, Total number of blocking requests rejected because the per-host exclusive connection cap was reached
   upstream_commands.upstream_rq_time, Histogram, Histogram of upstream request times for all types of requests
 
 .. _arch_overview_redis_cluster_command_stats:
@@ -152,9 +232,51 @@ INFO command is handled by envoy differently it aggregates metrics across all sh
 An optional section parameter can be provided to filter the output (e.g., INFO memory).
 INFO.SHARD is an Envoy-specific command introduced for debugging purposes that queries a specific shard by index
 and returns that shard's complete INFO response (e.g., INFO.SHARD 0 memory).
-Shard numbering starts from 0 and shards are ordered from lowest to highest slot assignment.
+Shard numbering starts from 0. With Redis Cluster, shards are ordered from lowest to highest slot
+assignment. With fixed static shard routing, the number is the configured endpoint
+``shard_index``.
 when using INFO.SHARD command, if the provided shard index is invalid, Envoy will return an error.
 when using INFO.SHARD command, via redis-cli, make sure to use --raw flag to get the proper output format.
+
+Shard-scoped scripts
+^^^^^^^^^^^^^^^^^^^^
+EVAL.SHARD and EVALSHA.SHARD are Envoy-specific commands that execute a script on one explicit
+shard ordinal:
+
+.. code-block:: none
+
+  EVAL.SHARD <shard_id> <script> <numkeys> [key ...] [arg ...]
+  EVALSHA.SHARD <shard_id> <sha1> <numkeys> [key ...] [arg ...]
+
+Envoy strips ``<shard_id>`` and forwards the corresponding Redis ``EVAL`` or ``EVALSHA`` command
+to that shard. The first declared key is used for prefix-route selection; a keyless script needs a
+catch-all route. The caller is responsible for ensuring that every key in the script belongs to
+the selected shard.
+
+Blocking list pops
+^^^^^^^^^^^^^^^^^^
+Envoy supports one-key ``BLPOP`` and ``BRPOP`` requests. A blocking pop owns an exclusive upstream
+connection until Redis responds, so later requests received on the same downstream connection are
+not dispatched until that response has been returned. This preserves Redis response ordering
+without allowing an unrelated pipelined request to overtake a blocked pop. The blocking pop also
+waits for earlier requests on that downstream connection to complete before it uses its separate
+upstream connection. Envoy applies downstream read backpressure while this dispatch barrier is
+active.
+
+The Redis timeout argument is preserved. A timeout of ``0`` waits indefinitely; a finite timeout
+uses Redis's timeout plus a small proxy grace period for Envoy's operation timer. Multiple keys
+are rejected because independent static shards can place them on different Redis instances, and
+blocking pops are not supported inside ``MULTI``/``EXEC`` transactions.
+
+If Redis returns a ``MOVED`` or ``ASK`` response for a blocking pop, Envoy passes that response
+downstream instead of retrying it through the shared pipelined pool, which would violate the
+exclusive-connection guarantee.
+
+Exclusive connections are separate from Envoy's shared pipelined Redis clients. Configure
+:ref:`blocking_command_settings <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.blocking_command_settings>`
+to cap active and idle exclusive connections per Redis host and per Envoy worker thread. The
+effective process-wide cap scales with the number of worker threads, and a VIP fronting multiple
+Envoy instances scales the aggregate cap by the number of instances.
 
 For details on each command's usage see the official
 `Redis command reference <https://redis.io/commands>`_.
@@ -239,6 +361,8 @@ For details on each command's usage see the official
   PFADD, HyperLogLog
   PFCOUNT, HyperLogLog
   PFMERGE, HyperLogLog
+  BLPOP, List
+  BRPOP, List
   LINDEX, List
   LINSERT, List
   LLEN, List
@@ -257,7 +381,9 @@ For details on each command's usage see the official
   RPUSHX, List
   PUBLISH, Pubsub
   EVAL, Scripting
+  EVAL.SHARD, Scripting
   EVALSHA, Scripting
+  EVALSHA.SHARD, Scripting
   SADD, Set
   SCARD, Set
   SISMEMBER, Set

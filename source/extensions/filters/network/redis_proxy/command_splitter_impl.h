@@ -161,6 +161,9 @@ public:
 
   // RedisProxy::CommandSplitter::SplitRequest
   void cancel() override;
+  bool blocksDownstreamDispatch() const override {
+    return wrapped_request_ptr_ != nullptr && wrapped_request_ptr_->blocksDownstreamDispatch();
+  }
 
   SplitRequestPtr wrapped_request_ptr_;
 
@@ -202,6 +205,25 @@ public:
 private:
   EvalRequest(SplitCallbacks& callbacks, CommandStats& command_stats, TimeSource& time_source,
               bool delay_command_latency)
+      : SingleServerRequest(callbacks, command_stats, time_source, delay_command_latency) {}
+};
+
+/**
+ * BlockingRequest hashes a one-key BLPOP/BRPOP request and keeps later commands on the same
+ * downstream connection from being dispatched until the blocking request completes.
+ */
+class BlockingRequest : public SingleServerRequest {
+public:
+  static SplitRequestPtr create(Router& router, Common::Redis::RespValuePtr&& incoming_request,
+                                SplitCallbacks& callbacks, CommandStats& command_stats,
+                                TimeSource& time_source, bool delay_command_latency,
+                                const StreamInfo::StreamInfo& stream_info);
+
+  bool blocksDownstreamDispatch() const override { return true; }
+
+private:
+  BlockingRequest(SplitCallbacks& callbacks, CommandStats& command_stats, TimeSource& time_source,
+                  bool delay_command_latency)
       : SingleServerRequest(callbacks, command_stats, time_source, delay_command_latency) {}
 };
 
@@ -341,6 +363,27 @@ private:
   ShardInfoRequest(SplitCallbacks& callbacks, CommandStats& command_stats, TimeSource& time_source,
                    bool delay_command_latency)
       : FragmentedRequest(callbacks, command_stats, time_source, delay_command_latency) {}
+  // RedisProxy::CommandSplitter::FragmentedRequest
+  void onChildResponse(Common::Redis::RespValuePtr&& value, uint32_t index) override;
+};
+
+/**
+ * ShardEvalRequest sends EVAL or EVALSHA to one explicitly indexed shard.
+ * Command format: EVAL.SHARD <shard_id> <script> <numkeys> [key ...] [arg ...]
+ *                 EVALSHA.SHARD <shard_id> <sha1> <numkeys> [key ...] [arg ...]
+ */
+class ShardEvalRequest : public FragmentedRequest {
+public:
+  static SplitRequestPtr create(Router& router, Common::Redis::RespValuePtr&& incoming_request,
+                                SplitCallbacks& callbacks, CommandStats& command_stats,
+                                TimeSource& time_source, bool delay_command_latency,
+                                const StreamInfo::StreamInfo& stream_info);
+
+private:
+  ShardEvalRequest(SplitCallbacks& callbacks, CommandStats& command_stats, TimeSource& time_source,
+                   bool delay_command_latency)
+      : FragmentedRequest(callbacks, command_stats, time_source, delay_command_latency) {}
+
   // RedisProxy::CommandSplitter::FragmentedRequest
   void onChildResponse(Common::Redis::RespValuePtr&& value, uint32_t index) override;
 };
@@ -515,6 +558,7 @@ public:
                absl::flat_hash_set<std::string>&& custom_commands);
 
   // RedisProxy::CommandSplitter::Instance
+  bool requiresDownstreamDispatchBarrier(const Common::Redis::RespValue& request) const override;
   SplitRequestPtr makeRequest(Common::Redis::RespValuePtr&& request, SplitCallbacks& callbacks,
                               Event::Dispatcher& dispatcher,
                               const StreamInfo::StreamInfo& stream_info) override;
@@ -536,11 +580,13 @@ private:
   RouterPtr router_;
   CommandHandlerFactory<SimpleRequest> simple_command_handler_;
   CommandHandlerFactory<EvalRequest> eval_command_handler_;
+  CommandHandlerFactory<BlockingRequest> blocking_command_handler_;
   CommandHandlerFactory<ObjectRequest> object_command_handler_;
   CommandHandlerFactory<MGETRequest> mget_handler_;
   CommandHandlerFactory<MSETRequest> mset_handler_;
   CommandHandlerFactory<ScanRequest> scan_handler_;
   CommandHandlerFactory<ShardInfoRequest> shard_info_handler_;
+  CommandHandlerFactory<ShardEvalRequest> shard_eval_handler_;
   CommandHandlerFactory<RandomShardRequest> random_shard_handler_;
   CommandHandlerFactory<SplitKeysSumResultRequest> split_keys_sum_result_handler_;
   CommandHandlerFactory<TransactionRequest> transaction_handler_;
