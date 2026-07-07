@@ -143,6 +143,7 @@ private:
     Common::Redis::RespValuePtr pending_request_value_;
     Common::Redis::RespValuePtr pending_response_;
     CommandSplitter::SplitRequestPtr request_handle_;
+    bool blocks_downstream_dispatch_{false};
   };
 
   void onQuit(PendingRequest& request);
@@ -151,6 +152,8 @@ private:
   void onResponse(PendingRequest& request, Common::Redis::RespValuePtr&& value);
   bool checkPassword(const std::string& password);
   void processRespValue(Common::Redis::RespValuePtr&& value, PendingRequest& request);
+  void resumePendingRequests();
+  void setDispatchBlocked(bool blocked);
 
   Common::Redis::DecoderPtr decoder_;
   Common::Redis::EncoderPtr encoder_;
@@ -165,6 +168,10 @@ private:
   ExternalAuth::ExternalAuthClientPtr auth_client_;
   ExternalAuthCallStatus external_auth_call_status_;
   long external_auth_expiration_epoch_;
+  // True while a blocking request is active or waiting behind earlier downstream requests.
+  bool dispatch_blocked_{false};
+  // True only after the current blocking request has been dispatched upstream.
+  bool dispatch_barrier_active_{false};
 };
 
 } // namespace RedisProxy

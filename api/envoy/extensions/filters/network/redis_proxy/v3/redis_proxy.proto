@@ -34,7 +34,7 @@ message RedisProxy {
       "envoy.config.filter.network.redis_proxy.v2.RedisProxy";
 
   // Redis connection pool settings.
-  // [#next-free-field: 11]
+  // [#next-free-field: 13]
   message ConnPoolSettings {
     option (udpa.annotations.versioning).previous_message_type =
         "envoy.config.filter.network.redis_proxy.v2.RedisProxy.ConnPoolSettings";
@@ -80,6 +80,26 @@ message RedisProxy {
       LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY = 6;
     }
 
+    // Settings for Redis commands that hold an upstream connection exclusively while waiting for
+    // a response, such as BLPOP and BRPOP.
+    message BlockingCommandSettings {
+      // Maximum number of active exclusive upstream connections per Redis host, per Envoy worker
+      // thread. Each blocking command owns one connection until Redis responds. The effective
+      // process-wide maximum is this value multiplied by the number of Envoy worker threads; when
+      // several Envoy instances sit behind a VIP, the aggregate maximum also scales with the
+      // number of instances. Defaults to 32.
+      google.protobuf.UInt32Value max_active_connections_per_host = 1
+          [(validate.rules).uint32 = {gt: 0}];
+
+      // Maximum number of idle exclusive upstream connections cached per Redis host, per Envoy
+      // worker thread. Set to 0 to disable idle connection reuse. The effective process-wide
+      // maximum is this value multiplied by the number of Envoy worker threads; when several
+      // Envoy instances sit behind a VIP, the aggregate maximum also scales with the number of
+      // instances. Defaults to 1.
+      google.protobuf.UInt32Value max_idle_connections_per_host = 2
+          [(validate.rules).uint32 = {gte: 0}];
+    }
+
     // Per-operation timeout in milliseconds. The timer starts when the first
     // command of a pipeline is written to the backend connection. Each response received from Redis
     // resets the timer since it signifies that the next command is being processed by the backend.
@@ -105,6 +125,8 @@ message RedisProxy {
     // redis servers, and retry commands to the specified target server. The target server does not
     // need to be known to the cluster manager. If the command cannot be redirected, then the
     // original error is passed downstream unchanged. By default, this support is not enabled.
+    // This cannot be combined with :ref:`static_shard_routing
+    // <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.static_shard_routing>`.
     bool enable_redirection = 3;
 
     // If ``enable_redirection`` is set to true this option configures the DNS cache that the
@@ -152,6 +174,34 @@ message RedisProxy {
     // storm to busy redis server. This config is a protection to rate limit reconnection rate.
     // If not set, there will be no rate limiting on the reconnection.
     ConnectionRateLimit connection_rate_limit = 10;
+
+    // Configures deterministic routing to a fixed set of independent Redis shards. When enabled,
+    // Envoy routes a key to ``XXH32(hashtag(key)) % shard_count`` using seed 0 over the exact
+    // key or hash-tag bytes. ``hashtag(key)`` uses the same Redis hash-tag extraction controlled
+    // by :ref:`enable_hashtagging
+    // <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_hashtagging>`.
+    //
+    // Each P0 endpoint must provide a unique integer ``shard_index`` in
+    // ``filter_metadata.envoy.filters.network.redis_proxy``. Indices are fixed in the range
+    // ``[0, shard_count)``. A missing, unhealthy, degraded, or excluded endpoint leaves its index
+    // unavailable; Envoy never renumbers or remaps other shards. This mode requires one priority,
+    // cannot be combined with Redis Cluster upstreams, and cannot be combined with
+    // :ref:`enable_redirection
+    // <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>`;
+    // an invalid topology fails closed instead of falling back to normal load-balancer routing.
+    // [#next-free-field: 2]
+    message StaticShardRouting {
+      // Number of fixed Redis shards. This must stay stable across Envoy instances and must match
+      // the endpoint ``shard_index`` assignment.
+      uint32 shard_count = 1 [(validate.rules).uint32 = {lte: 65535 gt: 0}];
+    }
+
+    // Enables deterministic static-shard routing for independent Redis instances.
+    StaticShardRouting static_shard_routing = 11;
+
+    // Settings for Redis commands that require an exclusive upstream connection while waiting for
+    // a response.
+    BlockingCommandSettings blocking_command_settings = 12;
   }
 
   message PrefixRoutes {

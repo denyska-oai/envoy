@@ -166,6 +166,11 @@ void ClientImpl::flushBufferAndResetTimer() {
 }
 
 PoolRequest* ClientImpl::makeRequest(const RespValue& request, ClientCallbacks& callbacks) {
+  return makeRequest(request, callbacks, RequestOptions{});
+}
+
+PoolRequest* ClientImpl::makeRequest(const RespValue& request, ClientCallbacks& callbacks,
+                                     const RequestOptions& options) {
   ASSERT(connection_->state() == Network::Connection::State::Open);
 
   const bool empty_buffer = encoder_buffer_.length() == 0;
@@ -180,7 +185,7 @@ PoolRequest* ClientImpl::makeRequest(const RespValue& request, ClientCallbacks& 
     command = redis_command_stats_->getUnusedStatName();
   }
 
-  pending_requests_.emplace_back(*this, callbacks, command);
+  pending_requests_.emplace_back(*this, callbacks, command, options);
   encoder_->encode(request, encoder_buffer_);
 
   // If we have enabled queuing (to pause AUTH while credentials are being used), don't flush our
@@ -201,7 +206,7 @@ PoolRequest* ClientImpl::makeRequest(const RespValue& request, ClientCallbacks& 
   // - This is the first request on the pipeline. Otherwise the timeout would effectively start on
   //   the last operation.
   if (connected_ && pending_requests_.size() == 1) {
-    connect_or_op_timer_->enableTimer(config_->opTimeout());
+    resetTimerForRequest(pending_requests_.front());
   }
 
   return &pending_requests_.back();
@@ -221,14 +226,17 @@ PoolRequest* ClientImpl::makeRequestImmediate(const RespValue& request,
     command = redis_command_stats_->getUnusedStatName();
   }
   Buffer::OwnedImpl immediate_buffer;
-  pending_requests_.emplace_back(*this, callbacks, command);
+  // Immediate requests are control-plane preludes (currently AWS IAM AUTH). They are written
+  // ahead of application requests held in encoder_buffer_, so their callback must also be first
+  // in the response queue.
+  pending_requests_.emplace_front(*this, callbacks, command, RequestOptions{});
   encoder_->encode(request, immediate_buffer);
   connection_->write(immediate_buffer, false);
   // Flush buffer if we've queued up any requests while waiting for authentication credentials
   if (encoder_buffer_.length()) {
     flushBufferAndResetTimer();
   }
-  return &pending_requests_.back();
+  return &pending_requests_.front();
 }
 
 void ClientImpl::onConnectOrOpTimeout() {
@@ -286,7 +294,7 @@ void ClientImpl::onEvent(Network::ConnectionEvent event) {
   } else if (event == Network::ConnectionEvent::Connected) {
     connected_ = true;
     ASSERT(!pending_requests_.empty());
-    connect_or_op_timer_->enableTimer(config_->opTimeout());
+    resetTimerForRequest(pending_requests_.front());
   }
 
   if (event == Network::ConnectionEvent::RemoteClose && !connected_) {
@@ -340,15 +348,16 @@ void ClientImpl::onRespValue(RespValuePtr&& value) {
   if (pending_requests_.empty()) {
     connect_or_op_timer_->disableTimer();
   } else {
-    connect_or_op_timer_->enableTimer(config_->opTimeout());
+    resetTimerForRequest(pending_requests_.front());
   }
 
   putOutlierEvent(Upstream::Outlier::Result::ExtOriginRequestSuccess);
 }
 
 ClientImpl::PendingRequest::PendingRequest(ClientImpl& parent, ClientCallbacks& callbacks,
-                                           Stats::StatName command)
-    : parent_(parent), callbacks_(callbacks), command_{command},
+                                           Stats::StatName command,
+                                           const RequestOptions& request_options)
+    : parent_(parent), callbacks_(callbacks), command_{command}, request_options_(request_options),
       aggregate_request_timer_(parent_.redis_command_stats_->createAggregateTimer(
           parent_.scope_, parent_.time_source_)) {
   if (parent_.config_->enableCommandStats()) {
@@ -359,6 +368,34 @@ ClientImpl::PendingRequest::PendingRequest(ClientImpl& parent, ClientCallbacks& 
   parent.host_->stats().rq_total_.inc();
   parent.host_->cluster().trafficStats()->upstream_rq_active_.inc();
   parent.host_->stats().rq_active_.inc();
+}
+
+std::optional<std::chrono::milliseconds>
+ClientImpl::requestTimeout(const PendingRequest& request) const {
+  switch (request.request_options_.op_timeout_mode_) {
+  case RequestOptions::OpTimeoutMode::UseDefault:
+    return config_->opTimeout();
+  case RequestOptions::OpTimeoutMode::Override:
+    return request.request_options_.op_timeout_;
+  case RequestOptions::OpTimeoutMode::Disabled:
+    // A queued AWS IAM request may be the first application request in pending_requests_ while
+    // credentials and AUTH are still outstanding. Keep the normal operation deadline until the
+    // control-plane prelude has been inserted at the front and completed.
+    if (queue_enabled_) {
+      return config_->opTimeout();
+    }
+    return std::nullopt;
+  }
+  PANIC_DUE_TO_CORRUPT_ENUM;
+}
+
+void ClientImpl::resetTimerForRequest(const PendingRequest& request) {
+  const auto timeout = requestTimeout(request);
+  if (timeout.has_value()) {
+    connect_or_op_timer_->enableTimer(timeout.value());
+  } else {
+    connect_or_op_timer_->disableTimer();
+  }
 }
 
 ClientImpl::PendingRequest::~PendingRequest() {

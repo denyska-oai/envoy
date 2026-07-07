@@ -26,6 +26,12 @@ public:
    * Cancel the request. No further request callbacks will be called.
    */
   virtual void cancel() PURE;
+
+  /**
+   * @return true when later commands from the same downstream Redis connection must not be
+   *         dispatched until this request completes.
+   */
+  virtual bool blocksDownstreamDispatch() const { return false; }
 };
 
 using SplitRequestPtr = std::unique_ptr<SplitRequest>;
@@ -81,6 +87,21 @@ public:
 class Instance {
 public:
   virtual ~Instance() = default;
+
+  /**
+   * Check whether a request must wait until all earlier requests on this downstream connection
+   * have completed, and must prevent later requests from being dispatched until it completes.
+   *
+   * This is called before makeRequest() so the filter can preserve Redis execution order for
+   * commands that use a separate upstream connection. If this returns true, the resulting
+   * SplitRequest must also return true from blocksDownstreamDispatch().
+   *
+   * @param request supplies the decoded request, which remains owned by the caller.
+   * @return true when the request needs a downstream dispatch barrier.
+   */
+  virtual bool requiresDownstreamDispatchBarrier(const Common::Redis::RespValue&) const {
+    return false;
+  }
 
   /**
    * Make a split redis request capable of being retried/redirected.

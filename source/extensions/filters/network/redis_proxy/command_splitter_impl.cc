@@ -1,7 +1,9 @@
 #include "source/extensions/filters/network/redis_proxy/command_splitter_impl.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/network/common/redis/supported_commands.h"
@@ -234,6 +236,67 @@ SplitRequestPtr EvalRequest::create(Router& router, Common::Redis::RespValuePtr&
     request_ptr->handle_ = makeSingleServerRequest(
         route, base_request->asArray()[0].asString(), base_request->asArray()[3].asString(),
         base_request, *request_ptr, callbacks.transaction());
+  }
+
+  if (!request_ptr->handle_) {
+    command_stats.error_.inc();
+    callbacks.onResponse(Common::Redis::Utility::makeError(Response::get().NoUpstreamHost));
+    return nullptr;
+  }
+
+  return request_ptr;
+}
+
+SplitRequestPtr BlockingRequest::create(Router& router,
+                                        Common::Redis::RespValuePtr&& incoming_request,
+                                        SplitCallbacks& callbacks, CommandStats& command_stats,
+                                        TimeSource& time_source, bool delay_command_latency,
+                                        const StreamInfo::StreamInfo& stream_info) {
+  // Multiple keys can span independent static shards. Restrict the initial support to one key
+  // rather than changing Redis's key-order semantics or silently choosing only the first shard.
+  if (incoming_request->asArray().size() != 3) {
+    callbacks.onResponse(Common::Redis::Utility::makeError(
+        "ERR Envoy Redis proxy supports exactly one key for BLPOP and BRPOP"));
+    command_stats.error_.inc();
+    return nullptr;
+  }
+
+  double timeout_seconds;
+  if (!absl::SimpleAtod(incoming_request->asArray()[2].asString(), &timeout_seconds) ||
+      !std::isfinite(timeout_seconds) || timeout_seconds < 0 ||
+      timeout_seconds >
+          static_cast<double>(std::numeric_limits<std::chrono::milliseconds::rep>::max()) /
+              1000.0) {
+    callbacks.onResponse(
+        Common::Redis::Utility::makeError("ERR timeout is not a finite non-negative number"));
+    command_stats.error_.inc();
+    return nullptr;
+  }
+
+  // Round up so Envoy never expires the exclusive request before Redis's own timeout. Check the
+  // rounded value before casting: doubles near int64 max cannot represent every integer and a
+  // rounded out-of-range value would make the cast undefined.
+  const double timeout_milliseconds = std::ceil(timeout_seconds * 1000.0);
+  if (!std::isfinite(timeout_milliseconds) ||
+      timeout_milliseconds >=
+          static_cast<double>(std::numeric_limits<std::chrono::milliseconds::rep>::max())) {
+    callbacks.onResponse(
+        Common::Redis::Utility::makeError("ERR timeout is not a finite non-negative number"));
+    command_stats.error_.inc();
+    return nullptr;
+  }
+  const auto blocking_timeout =
+      std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(timeout_milliseconds));
+  std::unique_ptr<BlockingRequest> request_ptr{
+      new BlockingRequest(callbacks, command_stats, time_source, delay_command_latency)};
+  const auto route = router.upstreamPool(incoming_request->asArray()[1].asString(), stream_info);
+  if (route) {
+    Common::Redis::RespValueSharedPtr base_request = std::move(incoming_request);
+    // Blocking pops remove data, so never mirror them.
+    request_ptr->handle_ = route->upstream(base_request->asArray()[0].asString())
+                               ->makeBlockingRequest(base_request->asArray()[1].asString(),
+                                                     ConnPool::RespVariant(base_request),
+                                                     *request_ptr, blocking_timeout);
   }
 
   if (!request_ptr->handle_) {
@@ -604,7 +667,107 @@ void ShardInfoRequest::onChildResponse(Common::Redis::RespValuePtr&& value, uint
 
   // For shard info request, we simply forward the response directly from the single shard
   ASSERT(num_pending_responses_ > 0);
+  --num_pending_responses_;
   ENVOY_LOG(debug, "shard info response from shard {}: '{}'", index, value->toString());
+
+  updateStats(value->type() != Common::Redis::RespType::Error);
+  callbacks_.onResponse(std::move(value));
+}
+
+SplitRequestPtr ShardEvalRequest::create(Router& router,
+                                         Common::Redis::RespValuePtr&& incoming_request,
+                                         SplitCallbacks& callbacks, CommandStats& command_stats,
+                                         TimeSource& time_source, bool delay_command_latency,
+                                         const StreamInfo::StreamInfo& stream_info) {
+  // Command format: EVAL.SHARD <shard_id> <script> <numkeys> [key ...] [arg ...]
+  //                 EVALSHA.SHARD <shard_id> <sha1> <numkeys> [key ...] [arg ...]
+  if (incoming_request->asArray().size() < 4) {
+    onWrongNumberOfArguments(callbacks, *incoming_request);
+    command_stats.error_.inc();
+    return nullptr;
+  }
+
+  uint16_t shard_id = 0;
+  if (!absl::SimpleAtoi(incoming_request->asArray()[1].asString(), &shard_id)) {
+    callbacks.onResponse(
+        Common::Redis::Utility::makeError("ERR invalid shard_id - must be a numeric shard index"));
+    command_stats.error_.inc();
+    return nullptr;
+  }
+
+  const std::string command = absl::AsciiStrToLower(incoming_request->asArray()[0].asString());
+  const std::string upstream_command = command == "eval.shard" ? "eval" : "evalsha";
+
+  // Route selection is separate from shard selection. Use the first declared key when one is
+  // available so prefix routes behave like EVAL/EVALSHA; keyless scripts require a catch-all route.
+  uint64_t num_keys = 0;
+  RouteSharedPtr route;
+  if (absl::SimpleAtoi(incoming_request->asArray()[3].asString(), &num_keys) && num_keys > 0 &&
+      incoming_request->asArray().size() > 4) {
+    // Match EVAL/EVALSHA prefix-route behavior: upstreamPool() may remove a route prefix or apply
+    // a key formatter, and that mutation must be forwarded to Redis as the first declared key.
+    route = router.upstreamPool(incoming_request->asArray()[4].asString(), stream_info);
+  } else {
+    // Keyless scripts still need a catch-all route, but there is no forwarded key to rewrite.
+    std::string empty_key;
+    route = router.upstreamPool(empty_key, stream_info);
+  }
+  const uint32_t shard_size = route ? route->upstream(upstream_command)->shardSize() : 0;
+  if (shard_size == 0) {
+    command_stats.error_.inc();
+    callbacks.onResponse(Common::Redis::Utility::makeError(Response::get().NoUpstreamHost));
+    return nullptr;
+  }
+  if (shard_id >= shard_size) {
+    callbacks.onResponse(Common::Redis::Utility::makeError(
+        fmt::format("ERR shard_id {} out of range (0-{})", shard_id, shard_size - 1)));
+    command_stats.error_.inc();
+    return nullptr;
+  }
+
+  std::unique_ptr<ShardEvalRequest> request_ptr{
+      new ShardEvalRequest(callbacks, command_stats, time_source, delay_command_latency)};
+  request_ptr->num_pending_responses_ = 1;
+  request_ptr->pending_requests_.reserve(1);
+
+  // Transform EVAL[SHA].SHARD <shard_id> ... to the corresponding Redis command.
+  Common::Redis::RespValuePtr eval_request(new Common::Redis::RespValue());
+  eval_request->type(Common::Redis::RespType::Array);
+  std::vector<Common::Redis::RespValue>& eval_array = eval_request->asArray();
+  eval_array.reserve(incoming_request->asArray().size() - 1);
+
+  Common::Redis::RespValue eval_command;
+  eval_command.type(Common::Redis::RespType::BulkString);
+  eval_command.asString() = upstream_command;
+  eval_array.push_back(eval_command);
+  eval_array.insert(eval_array.end(), incoming_request->asArray().begin() + 2,
+                    incoming_request->asArray().end());
+
+  Common::Redis::RespValueSharedPtr base_request = std::move(eval_request);
+  request_ptr->pending_requests_.emplace_back(*request_ptr, shard_id);
+  PendingRequest& pending_request = request_ptr->pending_requests_.back();
+
+  ENVOY_LOG(debug, "shard eval request to shard index {}: {}", shard_id, base_request->toString());
+  pending_request.handle_ = makeFragmentedRequestToShard(
+      route, upstream_command, shard_id, *base_request, pending_request, callbacks.transaction());
+
+  if (!pending_request.handle_) {
+    pending_request.onResponse(Common::Redis::Utility::makeError(Response::get().NoUpstreamHost));
+  }
+
+  if (request_ptr->num_pending_responses_ > 0) {
+    return request_ptr;
+  }
+
+  return nullptr;
+}
+
+void ShardEvalRequest::onChildResponse(Common::Redis::RespValuePtr&& value, uint32_t index) {
+  pending_requests_[0].handle_ = nullptr;
+
+  ASSERT(num_pending_responses_ > 0);
+  --num_pending_responses_;
+  ENVOY_LOG(debug, "shard eval response from shard {}: '{}'", index, value->toString());
 
   updateStats(value->type() != Common::Redis::RespType::Error);
   callbacks_.onResponse(std::move(value));
@@ -684,6 +847,7 @@ void RandomShardRequest::onChildResponse(Common::Redis::RespValuePtr&& value, ui
   // For random shard requests, we simply forward the response directly
   // No aggregation or special processing needed
   ASSERT(num_pending_responses_ > 0);
+  --num_pending_responses_;
   // index is the shard_index that responded (can be any value 0 to shard_size-1)
   ENVOY_LOG(debug, "random shard response from shard {}: '{}'", index, value->toString());
 
@@ -739,6 +903,7 @@ SplitRequestPtr ClusterScopeCmdRequest::create(Router& router,
   request_ptr->pending_requests_.reserve(shard_size);
 
   Common::Redis::RespValueSharedPtr base_request = std::move(incoming_request);
+  bool has_pending_handle = false;
   for (uint32_t shard_index = 0; shard_index < shard_size; shard_index++) {
     request_ptr->pending_requests_.emplace_back(*request_ptr, shard_index);
     PendingRequest& pending_request = request_ptr->pending_requests_.back();
@@ -751,10 +916,16 @@ SplitRequestPtr ClusterScopeCmdRequest::create(Router& router,
       ENVOY_LOG(error, "{}:failed to create request handle for shard index {}: '{}'", __func__,
                 shard_index, base_request->toString());
       pending_request.onResponse(Common::Redis::Utility::makeError(Response::get().NoUpstreamHost));
+    } else {
+      has_pending_handle = true;
     }
   }
 
-  return request_ptr;
+  // A static-shard topology can retain the configured shard count while one or more ordinals are
+  // unavailable. If every ordinal failed synchronously above, the final callback already sent the
+  // downstream response and may have removed the proxy filter's PendingRequest. Returning a live
+  // split handle in that state would make ProxyFilter::processRespValue() touch a popped request.
+  return has_pending_handle ? std::move(request_ptr) : nullptr;
 }
 
 SplitRequestPtr
@@ -968,8 +1139,9 @@ InstanceImpl::InstanceImpl(RouterPtr&& router, Stats::Scope& scope, const std::s
                            Common::Redis::FaultManagerPtr&& fault_manager,
                            absl::flat_hash_set<std::string>&& custom_commands)
     : router_(std::move(router)), simple_command_handler_(*router_),
-      eval_command_handler_(*router_), object_command_handler_(*router_), mget_handler_(*router_),
-      mset_handler_(*router_), scan_handler_(*router_), shard_info_handler_(*router_),
+      eval_command_handler_(*router_), blocking_command_handler_(*router_),
+      object_command_handler_(*router_), mget_handler_(*router_), mset_handler_(*router_),
+      scan_handler_(*router_), shard_info_handler_(*router_), shard_eval_handler_(*router_),
       random_shard_handler_(*router_), split_keys_sum_result_handler_(*router_),
       transaction_handler_(*router_), cluster_scope_handler_(*router_),
       stats_{ALL_COMMAND_SPLITTER_STATS(POOL_COUNTER_PREFIX(scope, stat_prefix + "splitter."))},
@@ -981,6 +1153,10 @@ InstanceImpl::InstanceImpl(RouterPtr&& router, Stats::Scope& scope, const std::s
 
   for (const std::string& command : Common::Redis::SupportedCommands::evalCommands()) {
     addHandler(scope, stat_prefix, command, latency_in_micros, eval_command_handler_);
+  }
+
+  for (const std::string& command : Common::Redis::SupportedCommands::blockingCommands()) {
+    addHandler(scope, stat_prefix, command, latency_in_micros, blocking_command_handler_);
   }
 
   for (const std::string& command : Common::Redis::SupportedCommands::objectCommands()) {
@@ -1004,6 +1180,10 @@ InstanceImpl::InstanceImpl(RouterPtr&& router, Stats::Scope& scope, const std::s
   addHandler(scope, stat_prefix, Common::Redis::SupportedCommands::infoShard(), latency_in_micros,
              shard_info_handler_);
 
+  for (const std::string& command : Common::Redis::SupportedCommands::evalShardCommands()) {
+    addHandler(scope, stat_prefix, command, latency_in_micros, shard_eval_handler_);
+  }
+
   for (const std::string& command : Common::Redis::SupportedCommands::randomShardCommands()) {
     addHandler(scope, stat_prefix, command, latency_in_micros, random_shard_handler_);
   }
@@ -1020,6 +1200,17 @@ InstanceImpl::InstanceImpl(RouterPtr&& router, Stats::Scope& scope, const std::s
     // treating custom commands to be simple commands for now
     addHandler(scope, stat_prefix, command, latency_in_micros, simple_command_handler_);
   }
+}
+
+bool InstanceImpl::requiresDownstreamDispatchBarrier(
+    const Common::Redis::RespValue& request) const {
+  if (request.type() != Common::Redis::RespType::Array || request.asArray().empty() ||
+      request.asArray()[0].type() != Common::Redis::RespType::BulkString) {
+    return false;
+  }
+
+  const std::string command_name = absl::AsciiStrToLower(request.asArray()[0].asString());
+  return Common::Redis::SupportedCommands::blockingCommands().contains(command_name);
 }
 
 SplitRequestPtr InstanceImpl::makeRequest(Common::Redis::RespValuePtr&& request,

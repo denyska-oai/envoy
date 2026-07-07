@@ -64,6 +64,20 @@ struct SupportedCommands {
   }
 
   /**
+   * @return Envoy-specific EVAL commands which target a shard by index
+   */
+  static const absl::flat_hash_set<std::string>& evalShardCommands() {
+    CONSTRUCT_ON_FIRST_USE(absl::flat_hash_set<std::string>, "eval.shard", "evalsha.shard");
+  }
+
+  /**
+   * @return commands which block on one key and require an exclusive upstream connection.
+   */
+  static const absl::flat_hash_set<std::string>& blockingCommands() {
+    CONSTRUCT_ON_FIRST_USE(absl::flat_hash_set<std::string>, "blpop", "brpop");
+  }
+
+  /**
    * @return commands which hash on the third argument (subcommand key pattern)
    * OBJECT subcommand key [arguments] -> key is at index 2
    */
@@ -171,16 +185,17 @@ struct SupportedCommands {
   static const absl::flat_hash_set<std::string>& writeCommands() {
     CONSTRUCT_ON_FIRST_USE(
         absl::flat_hash_set<std::string>, "append", "bitfield", "decr", "decrby", "del", "discard",
-        "exec", "expire", "expireat", "eval", "evalsha", "geoadd", "getdel", "hdel", "hexpire",
-        "hexpireat", "hincrby", "hincrbyfloat", "hmset", "hpersist", "hpexpire", "hpexpireat",
-        "hset", "hsetnx", "incr", "incrby", "incrbyfloat", "linsert", "lmove", "lpop", "lpush",
-        "lpushx", "lrem", "lset", "ltrim", "mset", "multi", "persist", "pexpire", "pexpireat",
-        "pfadd", "psetex", "restore", "rpop", "rpush", "rpushx", "sadd", "set", "setbit", "setex",
-        "setnx", "setrange", "spop", "srem", "zadd", "zincrby", "touch", "zpopmin", "zpopmax",
-        "zrem", "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "unlink", "copy",
-        "rpoplpush", "smove", "sinterstore", "zunionstore", "zinterstore", "pfmerge", "georadius",
-        "georadiusbymember", "rename", "sort", "sdiffstore", "msetnx", "zrangestore", "sunionstore",
-        "geosearchstore", "zdiffstore", "bitop", "renamenx");
+        "exec", "expire", "expireat", "eval", "eval.shard", "evalsha", "evalsha.shard", "blpop",
+        "brpop", "geoadd", "getdel", "hdel", "hexpire", "hexpireat", "hincrby", "hincrbyfloat",
+        "hmset", "hpersist", "hpexpire", "hpexpireat", "hset", "hsetnx", "incr", "incrby",
+        "incrbyfloat", "linsert", "lmove", "lpop", "lpush", "lpushx", "lrem", "lset", "ltrim",
+        "mset", "multi", "persist", "pexpire", "pexpireat", "pfadd", "psetex", "restore", "rpop",
+        "rpush", "rpushx", "sadd", "set", "setbit", "setex", "setnx", "setrange", "spop", "srem",
+        "zadd", "zincrby", "touch", "zpopmin", "zpopmax", "zrem", "zremrangebylex",
+        "zremrangebyrank", "zremrangebyscore", "unlink", "copy", "rpoplpush", "smove",
+        "sinterstore", "zunionstore", "zinterstore", "pfmerge", "georadius", "georadiusbymember",
+        "rename", "sort", "sdiffstore", "msetnx", "zrangestore", "sunionstore", "geosearchstore",
+        "zdiffstore", "bitop", "renamenx");
   }
 
   static bool isReadCommand(const std::string& command) {

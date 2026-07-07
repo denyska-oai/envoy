@@ -65,6 +65,26 @@ public:
   virtual Common::Redis::Client::PoolRequest*
   makeRequest(const std::string& hash_key, RespVariant&& request, PoolCallbacks& callbacks,
               Common::Redis::Client::Transaction& transaction) PURE;
+
+  /**
+   * Makes a blocking Redis request on an exclusive upstream connection.
+   *
+   * The connection is checked out for one in-flight request and is never shared with the
+   * pipelined client. This is used by connection-affine Redis commands such as one-key BLPOP and
+   * BRPOP.
+   *
+   * @param hash_key supplies the key to use for upstream selection.
+   * @param request supplies the request to make.
+   * @param callbacks supplies the request completion callbacks.
+   * @param blocking_timeout supplies the Redis blocking timeout. Zero means that Redis may block
+   *        indefinitely; otherwise the pool adds the configured operation timeout as grace for
+   *        network and scheduling overhead.
+   * @return PoolRequest* a handle to the active request or nullptr if the request could not be
+   *         made for some reason.
+   */
+  virtual Common::Redis::Client::PoolRequest*
+  makeBlockingRequest(const std::string& hash_key, RespVariant&& request, PoolCallbacks& callbacks,
+                      std::chrono::milliseconds blocking_timeout) PURE;
   /**
    * Makes a redis request.
    * @param shard_index supplies the key to use for consistent hashing.

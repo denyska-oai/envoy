@@ -106,6 +106,11 @@ public:
                                    NetworkFilters::Common::Redis::Client::ReadPolicy::Primary,
                                const std::string& client_zone = "");
 
+  /**
+   * Extract the Redis hash tag from a key when hash tagging is enabled.
+   */
+  static absl::string_view hashtag(absl::string_view key, bool enabled);
+
   // Upstream::LoadBalancerContextBase
   std::optional<uint64_t> computeHashKey() override { return hash_key_; }
 
@@ -118,8 +123,6 @@ public:
   const std::string& clientZone() const override { return client_zone_; }
 
 private:
-  absl::string_view hashtag(absl::string_view v, bool enabled);
-
   static bool isReadRequest(const NetworkFilters::Common::Redis::RespValue& request);
 
   const std::optional<uint64_t> hash_key_;
